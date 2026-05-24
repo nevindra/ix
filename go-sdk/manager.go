@@ -36,6 +36,8 @@ type ManagerConfig struct {
 	DefaultEgress *EgressPolicy // optional default egress policy applied to all sandboxes
 	PoolSize      int           // Number of containers to keep pre-warmed (default: 0 = disabled)
 	PoolMinReady  int           // Minimum ready containers before triggering replenishment (default: 1)
+	PoolWorkers   int           // Parallel workers for pool fill (default: 3)
+	SharedNetwork bool          // Use a single shared bridge network for all sandboxes
 }
 
 // applyDefaults fills zero-valued fields with sensible defaults.
@@ -64,6 +66,9 @@ func (c *ManagerConfig) applyDefaults() {
 	if c.PoolSize > 0 && c.PoolMinReady == 0 {
 		c.PoolMinReady = 1
 	}
+	if c.PoolSize > 0 && c.PoolWorkers == 0 {
+		c.PoolWorkers = 3
+	}
 }
 
 // poolEntry represents a pre-warmed container ready to be claimed.
@@ -87,9 +92,11 @@ type IXManager struct {
 	ctx       context.Context
 	cancel    context.CancelFunc
 	logger    *slog.Logger
-	pool      []*poolEntry  // pre-warmed containers ready to be claimed
-	poolMu    sync.Mutex    // guards pool slice
-	poolStop  chan struct{} // signals pool replenisher to stop
+	pool              []*poolEntry  // pre-warmed containers ready to be claimed
+	poolMu            sync.Mutex    // guards pool slice
+	poolStop          chan struct{} // signals pool replenisher to stop
+	sharedNetworkID   string
+	sharedNetworkName string
 }
 
 // NewManager connects to Docker, auto-detects limits, and starts background
@@ -129,6 +136,14 @@ func NewManager(ctx context.Context, cfg ManagerConfig) (*IXManager, error) {
 		poolStop:  make(chan struct{}),
 	}
 	m.accepting.Store(true)
+
+	if cfg.SharedNetwork {
+		if err := m.initSharedNetwork(mCtx); err != nil {
+			cli.Close()
+			cancel()
+			return nil, err
+		}
+	}
 
 	// Recover existing containers from a previous run.
 	if err := m.recover(mCtx); err != nil {
@@ -210,19 +225,11 @@ func (m *IXManager) Create(ctx context.Context, opts sandbox.CreateOpts) (sandbo
 	}
 
 	sandboxID := uuid.NewString()[:12]
-	networkName := "sandbox-" + sandboxID
 
-	// Create per-sandbox network.
-	netResp, err := m.docker.NetworkCreate(ctx, networkName, network.CreateOptions{
-		Driver: "bridge",
-		Labels: map[string]string{
-			"oasis.sandbox": "true",
-			"oasis.session": resolved.SessionID,
-		},
-	})
+	networkID, networkName, err := m.allocateNetwork(ctx, sandboxID, resolved.SessionID)
 	if err != nil {
 		m.releaseSlot()
-		return nil, fmt.Errorf("create network: %w", err)
+		return nil, err
 	}
 
 	// Build container config.
@@ -232,7 +239,7 @@ func (m *IXManager) Create(ctx context.Context, opts sandbox.CreateOpts) (sandbo
 	// Unix socket: create host-side temp dir, mount into container at /run/ix.
 	socketDir := filepath.Join(os.TempDir(), "ix-"+sandboxID)
 	if err := os.MkdirAll(socketDir, 0o777); err != nil {
-		_ = m.docker.NetworkRemove(ctx, netResp.ID)
+		m.cleanupNetwork(ctx, networkID)
 		m.releaseSlot()
 		return nil, fmt.Errorf("create socket dir: %w", err)
 	}
@@ -293,7 +300,7 @@ func (m *IXManager) Create(ctx context.Context, opts sandbox.CreateOpts) (sandbo
 
 	resp, err := m.docker.ContainerCreate(ctx, containerCfg, hostCfg, nil, nil, "sandbox-"+sandboxID)
 	if err != nil {
-		_ = m.docker.NetworkRemove(ctx, netResp.ID)
+		m.cleanupNetwork(ctx, networkID)
 		_ = os.RemoveAll(socketDir)
 		m.releaseSlot()
 		return nil, fmt.Errorf("create container: %w", err)
@@ -301,15 +308,15 @@ func (m *IXManager) Create(ctx context.Context, opts sandbox.CreateOpts) (sandbo
 
 	if err := m.docker.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
 		_ = m.docker.ContainerRemove(ctx, resp.ID, container.RemoveOptions{Force: true})
-		_ = m.docker.NetworkRemove(ctx, netResp.ID)
+		m.cleanupNetwork(ctx, networkID)
 		_ = os.RemoveAll(socketDir)
 		m.releaseSlot()
 		return nil, fmt.Errorf("start container: %w", err)
 	}
 
 	socketTransport := unixSocketTransport(socketPath)
-	if err := m.waitReady(ctx, "http://localhost", socketTransport); err != nil {
-		_ = m.destroyContainer(ctx, resp.ID, netResp.ID)
+	if err := m.waitReady(ctx, "http://localhost", socketTransport, socketPath); err != nil {
+		_ = m.destroyContainer(ctx, resp.ID, networkID)
 		_ = os.RemoveAll(socketDir)
 		m.releaseSlot()
 		return nil, fmt.Errorf("wait ready: %w", err)
@@ -321,7 +328,7 @@ func (m *IXManager) Create(ctx context.Context, opts sandbox.CreateOpts) (sandbo
 		containerID: resp.ID,
 		baseURL:     "http://localhost",
 		client:      newClient("http://localhost", httpClient),
-		networkID:   netResp.ID,
+		networkID:   networkID,
 		socketDir:   socketDir,
 		createdAt:   now,
 		expiresAt:   now.Add(ttl),
@@ -419,6 +426,15 @@ func (m *IXManager) Close() error {
 		m.releaseSlot()
 	}
 
+	if m.sharedNetworkID != "" {
+		if err := m.docker.NetworkRemove(context.Background(), m.sharedNetworkID); err != nil {
+			m.logger.Warn("shared network remove failed", "error", err)
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+
 	if err := m.docker.Close(); err != nil && firstErr == nil {
 		firstErr = err
 	}
@@ -479,15 +495,13 @@ func (m *IXManager) destroy(ctx context.Context, sessionID string) error {
 func (m *IXManager) destroyContainer(ctx context.Context, containerID, networkID string) error {
 	timeout := 10
 	_ = m.docker.ContainerStop(ctx, containerID, container.StopOptions{Timeout: &timeout})
+	if networkID != "" {
+		_ = m.docker.NetworkDisconnect(ctx, networkID, containerID, true)
+	}
 	if err := m.docker.ContainerRemove(ctx, containerID, container.RemoveOptions{Force: true}); err != nil {
 		m.logger.Warn("container remove failed", "container", containerID, "error", err)
 	}
-	if networkID != "" {
-		if err := m.docker.NetworkRemove(ctx, networkID); err != nil {
-			m.logger.Warn("network remove failed", "network", networkID, "error", err)
-			return fmt.Errorf("network remove: %w", err)
-		}
-	}
+	m.cleanupNetwork(ctx, networkID)
 	return nil
 }
 
@@ -585,14 +599,44 @@ func (m *IXManager) resolveConnection(ctx context.Context, containerID string) (
 	}, nil
 }
 
-// waitReady polls the ix daemon health endpoint until it responds with HTTP 200
-// or the context/timeout expires. Pass a non-nil transport for Unix socket mode.
-func (m *IXManager) waitReady(ctx context.Context, baseURL string, transport http.RoundTripper) error {
+// waitReady waits for the ix daemon to become healthy. When socketPath is
+// non-empty it first waits for the socket file to appear (10ms poll), then
+// does rapid HTTP health checks (25ms). This replaces the old 500ms poll.
+func (m *IXManager) waitReady(ctx context.Context, baseURL string, transport http.RoundTripper, socketPath string) error {
 	deadline := time.After(60 * time.Second)
-	ticker := time.NewTicker(500 * time.Millisecond)
+
+	if socketPath != "" {
+		if err := waitForSocket(ctx, socketPath, deadline); err != nil {
+			return err
+		}
+	}
+
+	return pollHealth(ctx, baseURL, transport, deadline)
+}
+
+func waitForSocket(ctx context.Context, socketPath string, deadline <-chan time.Time) error {
+	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 
-	httpClient := &http.Client{Timeout: 3 * time.Second, Transport: transport}
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-deadline:
+			return fmt.Errorf("socket not ready after timeout: %s", socketPath)
+		case <-ticker.C:
+			if _, err := os.Stat(socketPath); err == nil {
+				return nil
+			}
+		}
+	}
+}
+
+func pollHealth(ctx context.Context, baseURL string, transport http.RoundTripper, deadline <-chan time.Time) error {
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+
+	httpClient := &http.Client{Timeout: 1 * time.Second, Transport: transport}
 	endpoint := baseURL + "/health"
 
 	for {
@@ -600,7 +644,7 @@ func (m *IXManager) waitReady(ctx context.Context, baseURL string, transport htt
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-deadline:
-			return fmt.Errorf("sandbox not ready after 60s at %s", baseURL)
+			return fmt.Errorf("sandbox not ready after timeout at %s", baseURL)
 		case <-ticker.C:
 			req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 			if err != nil {
@@ -694,37 +738,51 @@ func (m *IXManager) poolReplenisher(ctx context.Context) {
 	}
 }
 
-// fillPool creates pool entries until the pool reaches PoolSize.
+// fillPool creates pool entries in parallel until the pool reaches PoolSize.
 func (m *IXManager) fillPool(ctx context.Context) {
-	for {
-		m.poolMu.Lock()
-		currentSize := len(m.pool)
-		m.poolMu.Unlock()
+	m.poolMu.Lock()
+	needed := m.cfg.PoolSize - len(m.pool)
+	m.poolMu.Unlock()
 
-		if currentSize >= m.cfg.PoolSize {
-			return
-		}
+	if needed <= 0 {
+		return
+	}
 
+	workers := min(needed, m.cfg.PoolWorkers)
+	if workers < 1 {
+		workers = 1
+	}
+
+	type result struct {
+		entry *poolEntry
+		err   error
+	}
+	ch := make(chan result, workers)
+
+	for i := 0; i < workers; i++ {
+		go func() {
+			entry, err := m.createPoolEntry(ctx)
+			ch <- result{entry, err}
+		}()
+	}
+
+	for i := 0; i < workers; i++ {
 		select {
 		case <-ctx.Done():
 			return
 		case <-m.poolStop:
 			return
-		default:
+		case r := <-ch:
+			if r.err != nil {
+				m.logger.Warn("pool fill failed", "error", r.err)
+				continue
+			}
+			m.poolMu.Lock()
+			m.pool = append(m.pool, r.entry)
+			poolSize := len(m.pool)
+			m.poolMu.Unlock()
+			m.logger.Info("pool entry created", "poolSize", poolSize, "target", m.cfg.PoolSize)
 		}
-
-		entry, err := m.createPoolEntry(ctx)
-		if err != nil {
-			m.logger.Warn("pool fill failed", "error", err)
-			return // back off on error; ticker will retry
-		}
-
-		m.poolMu.Lock()
-		m.pool = append(m.pool, entry)
-		poolSize := len(m.pool)
-		m.poolMu.Unlock()
-
-		m.logger.Info("pool entry created", "poolSize", poolSize, "target", m.cfg.PoolSize)
 	}
 }
 
@@ -738,23 +796,16 @@ func (m *IXManager) createPoolEntry(ctx context.Context) (*poolEntry, error) {
 	}
 
 	sandboxID := uuid.NewString()[:12]
-	networkName := "sandbox-" + sandboxID
 
-	netResp, err := m.docker.NetworkCreate(ctx, networkName, network.CreateOptions{
-		Driver: "bridge",
-		Labels: map[string]string{
-			"oasis.sandbox": "true",
-			"oasis.pool":    "true",
-		},
-	})
+	networkID, networkName, err := m.allocateNetwork(ctx, sandboxID, "")
 	if err != nil {
 		m.releaseSlot()
-		return nil, fmt.Errorf("pool create network: %w", err)
+		return nil, err
 	}
 
 	socketDir := filepath.Join(os.TempDir(), "ix-"+sandboxID)
 	if err := os.MkdirAll(socketDir, 0o777); err != nil {
-		_ = m.docker.NetworkRemove(ctx, netResp.ID)
+		m.cleanupNetwork(ctx, networkID)
 		m.releaseSlot()
 		return nil, fmt.Errorf("pool create socket dir: %w", err)
 	}
@@ -801,7 +852,7 @@ func (m *IXManager) createPoolEntry(ctx context.Context) (*poolEntry, error) {
 
 	resp, err := m.docker.ContainerCreate(ctx, containerCfg, hostCfg, nil, nil, "sandbox-"+sandboxID)
 	if err != nil {
-		_ = m.docker.NetworkRemove(ctx, netResp.ID)
+		m.cleanupNetwork(ctx, networkID)
 		_ = os.RemoveAll(socketDir)
 		m.releaseSlot()
 		return nil, fmt.Errorf("pool create container: %w", err)
@@ -809,15 +860,15 @@ func (m *IXManager) createPoolEntry(ctx context.Context) (*poolEntry, error) {
 
 	if err := m.docker.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
 		_ = m.docker.ContainerRemove(ctx, resp.ID, container.RemoveOptions{Force: true})
-		_ = m.docker.NetworkRemove(ctx, netResp.ID)
+		m.cleanupNetwork(ctx, networkID)
 		_ = os.RemoveAll(socketDir)
 		m.releaseSlot()
 		return nil, fmt.Errorf("pool start container: %w", err)
 	}
 
 	socketTransport := unixSocketTransport(socketPath)
-	if err := m.waitReady(ctx, "http://localhost", socketTransport); err != nil {
-		_ = m.destroyContainer(ctx, resp.ID, netResp.ID)
+	if err := m.waitReady(ctx, "http://localhost", socketTransport, socketPath); err != nil {
+		_ = m.destroyContainer(ctx, resp.ID, networkID)
 		_ = os.RemoveAll(socketDir)
 		m.releaseSlot()
 		return nil, fmt.Errorf("pool wait ready: %w", err)
@@ -825,7 +876,7 @@ func (m *IXManager) createPoolEntry(ctx context.Context) (*poolEntry, error) {
 
 	return &poolEntry{
 		containerID: resp.ID,
-		networkID:   netResp.ID,
+		networkID:   networkID,
 		baseURL:     "http://localhost",
 		socketDir:   socketDir,
 		image:       m.cfg.Image,
@@ -880,6 +931,60 @@ func (m *IXManager) replenishPool() {
 	m.poolMu.Unlock()
 
 	m.logger.Info("pool replenished", "poolSize", poolSize, "target", m.cfg.PoolSize)
+}
+
+// --- Network helpers ---
+
+// initSharedNetwork creates or reuses the shared bridge network.
+func (m *IXManager) initSharedNetwork(ctx context.Context) error {
+	name := "oasis-sandbox-shared"
+	info, err := m.docker.NetworkInspect(ctx, name, network.InspectOptions{})
+	if err == nil {
+		m.sharedNetworkID = info.ID
+		m.sharedNetworkName = name
+		return nil
+	}
+	netResp, err := m.docker.NetworkCreate(ctx, name, network.CreateOptions{
+		Driver: "bridge",
+		Labels: map[string]string{"oasis.sandbox": "true", "oasis.shared": "true"},
+	})
+	if err != nil {
+		return fmt.Errorf("create shared network: %w", err)
+	}
+	m.sharedNetworkID = netResp.ID
+	m.sharedNetworkName = name
+	return nil
+}
+
+// allocateNetwork returns a network for the sandbox. With SharedNetwork it
+// returns the shared network; otherwise it creates a new per-sandbox bridge.
+func (m *IXManager) allocateNetwork(ctx context.Context, sandboxID, sessionID string) (networkID, networkName string, err error) {
+	if m.sharedNetworkID != "" {
+		return m.sharedNetworkID, m.sharedNetworkName, nil
+	}
+	networkName = "sandbox-" + sandboxID
+	labels := map[string]string{"oasis.sandbox": "true"}
+	if sessionID != "" {
+		labels["oasis.session"] = sessionID
+	}
+	netResp, err := m.docker.NetworkCreate(ctx, networkName, network.CreateOptions{
+		Driver: "bridge",
+		Labels: labels,
+	})
+	if err != nil {
+		return "", "", fmt.Errorf("create network: %w", err)
+	}
+	return netResp.ID, networkName, nil
+}
+
+// cleanupNetwork removes the network unless it is the shared network.
+func (m *IXManager) cleanupNetwork(ctx context.Context, networkID string) {
+	if networkID == "" || networkID == m.sharedNetworkID {
+		return
+	}
+	if err := m.docker.NetworkRemove(ctx, networkID); err != nil {
+		m.logger.Warn("network remove failed", "network", networkID, "error", err)
+	}
 }
 
 // Compile-time check that IXManager implements sandbox.Manager.

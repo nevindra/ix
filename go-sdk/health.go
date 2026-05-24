@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/network"
 	"github.com/google/uuid"
 )
 
@@ -89,24 +88,17 @@ func (m *IXManager) restart(ctx context.Context, sessionID string) {
 
 	// Create replacement.
 	sandboxID := uuid.NewString()[:12]
-	networkName := "sandbox-" + sandboxID
 	now := time.Now()
 
-	netResp, err := m.docker.NetworkCreate(ctx, networkName, network.CreateOptions{
-		Driver: "bridge",
-		Labels: map[string]string{
-			"oasis.sandbox": "true",
-			"oasis.session": sessionID,
-		},
-	})
+	networkID, networkName, err := m.allocateNetwork(ctx, sandboxID, sessionID)
 	if err != nil {
-		m.logger.Error("restart: create network failed", "session", sessionID, "error", err)
+		m.logger.Error("restart: allocate network failed", "session", sessionID, "error", err)
 		return
 	}
 
 	socketDir := filepath.Join(os.TempDir(), "ix-"+sandboxID)
 	if err := os.MkdirAll(socketDir, 0o777); err != nil {
-		_ = m.docker.NetworkRemove(ctx, netResp.ID)
+		m.cleanupNetwork(ctx, networkID)
 		m.logger.Error("restart: create socket dir failed", "session", sessionID, "error", err)
 		return
 	}
@@ -145,7 +137,7 @@ func (m *IXManager) restart(ctx context.Context, sessionID string) {
 
 	resp, err := m.docker.ContainerCreate(ctx, containerCfg, hostCfg, nil, nil, "sandbox-"+sandboxID)
 	if err != nil {
-		_ = m.docker.NetworkRemove(ctx, netResp.ID)
+		m.cleanupNetwork(ctx, networkID)
 		_ = os.RemoveAll(socketDir)
 		m.logger.Error("restart: create container failed", "session", sessionID, "error", err)
 		return
@@ -153,15 +145,15 @@ func (m *IXManager) restart(ctx context.Context, sessionID string) {
 
 	if err := m.docker.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
 		_ = m.docker.ContainerRemove(ctx, resp.ID, container.RemoveOptions{Force: true})
-		_ = m.docker.NetworkRemove(ctx, netResp.ID)
+		m.cleanupNetwork(ctx, networkID)
 		_ = os.RemoveAll(socketDir)
 		m.logger.Error("restart: start container failed", "session", sessionID, "error", err)
 		return
 	}
 
 	socketTransport := unixSocketTransport(socketPath)
-	if err := m.waitReady(ctx, "http://localhost", socketTransport); err != nil {
-		_ = m.destroyContainer(ctx, resp.ID, netResp.ID)
+	if err := m.waitReady(ctx, "http://localhost", socketTransport, socketPath); err != nil {
+		_ = m.destroyContainer(ctx, resp.ID, networkID)
 		_ = os.RemoveAll(socketDir)
 		m.logger.Error("restart: wait ready failed", "session", sessionID, "error", err)
 		return
@@ -173,7 +165,7 @@ func (m *IXManager) restart(ctx context.Context, sessionID string) {
 		containerID:  resp.ID,
 		baseURL:      "http://localhost",
 		client:       newClient("http://localhost", httpClient),
-		networkID:    netResp.ID,
+		networkID:    networkID,
 		socketDir:    socketDir,
 		createdAt:    now,
 		expiresAt:    now.Add(remainingTTL),
