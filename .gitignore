@@ -1,0 +1,18 @@
+# Rust
+daemon/target/
+
+# Go
+go-sdk/vendor/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Snapshots (generated)
+codedb.snapshot

@@ -1,0 +1,22 @@
+[package]
+name = "ix-shell"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ix-core = { path = "../ix-core" }
+tokio.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+nix = { version = "0.29", features = ["signal", "process"] }
+
+[dev-dependencies]
+ix-core = { path = "../ix-core", features = ["test-utils"] }
+criterion.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt", "macros"] }
+
+[[bench]]
+name = "shell_bench"
+harness = false

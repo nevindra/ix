@@ -1,0 +1,20 @@
+[package]
+name = "ix-egress"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ix-core = { path = "../ix-core" }
+tokio.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+hickory-proto = "0.25"
+
+[dev-dependencies]
+criterion.workspace = true
+tokio = { workspace = true, features = ["rt", "macros"] }
+
+[[bench]]
+name = "egress_bench"
+harness = false

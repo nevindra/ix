@@ -1,0 +1,22 @@
+[package]
+name = "ix-fetch"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ix-core = { path = "../ix-core" }
+tokio.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+reqwest = { version = "0.12", features = ["rustls-tls"], default-features = false }
+scraper = "0.22"
+regex = "1"
+url = "2"
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "fetch_bench"
+harness = false

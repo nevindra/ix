@@ -1,0 +1,42 @@
+[package]
+name = "ix-server"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "ix_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ixd"
+path = "src/main.rs"
+
+[dependencies]
+ix-core = { path = "../ix-core" }
+ix-shell = { path = "../ix-shell" }
+ix-files = { path = "../ix-files" }
+ix-fetch = { path = "../ix-fetch" }
+ix-browser = { path = "../ix-browser" }
+ix-code = { path = "../ix-code" }
+ix-egress = { path = "../ix-egress" }
+
+axum.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+bytes.workspace = true
+tokio-stream.workspace = true
+
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tower-http = { version = "0.6", features = ["cors"] }
+axum-extra = { version = "0.10", features = ["multipart"] }
+tokio-util = { version = "0.7", features = ["io"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
+tower = { version = "0.5", features = ["util"] }
+tempfile.workspace = true
+http-body-util = "0.1"
+async-trait = "0.1"

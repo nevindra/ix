@@ -1,0 +1,27 @@
+[package]
+name = "ix-core"
+version.workspace = true
+edition.workspace = true
+
+[features]
+test-utils = []
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+bytes.workspace = true
+axum.workspace = true
+tokio-stream.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+tokio = { workspace = true, features = ["rt", "macros"] }
+http-body-util = "0.1"
+
+[[bench]]
+name = "core_bench"
+harness = false

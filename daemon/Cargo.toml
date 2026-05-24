@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+# Shared dependencies used across multiple crates
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+thiserror = "2"
+tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }
+bytes = "1"
+axum = { version = "0.8", features = ["macros"] }
+tokio-stream = "0.1"
+criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = "3"

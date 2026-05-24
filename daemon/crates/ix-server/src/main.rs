@@ -1,0 +1,117 @@
+use std::sync::Arc;
+
+use tokio::signal;
+use tracing::{error, info};
+use tracing_subscriber::EnvFilter;
+
+use ix_server::router;
+use ix_server::state::AppState;
+
+#[tokio::main]
+async fn main() {
+    // 1. Init tracing
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
+
+    // 2. Load config from env
+    let config = ix_core::config::DaemonConfig::from_env();
+    let addr = config.addr.clone();
+    let socket = config.socket.clone();
+    info!(addr = %addr, workspace = %config.workspace, "starting ixd");
+
+    // 3. Create shared state
+    let browser = Arc::new(ix_browser::PinchtabBackend::new().await);
+    let browser_trait: Arc<dyn ix_browser::BrowserBackend> = browser.clone();
+
+    let kernels = Arc::new(ix_code::KernelManager::new());
+
+    let egress = if config.egress.enabled {
+        match ix_egress::EgressFilter::start(config.egress.clone()).await {
+            Ok(filter) => {
+                info!("egress filter started");
+                Some(Arc::new(filter))
+            }
+            Err(e) => {
+                error!(error = %e, "failed to start egress filter, continuing without it");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let state = Arc::new(AppState {
+        config,
+        browser: browser_trait,
+        kernels: kernels.clone(),
+        egress: egress.clone(),
+        start_time: std::time::Instant::now(),
+    });
+
+    // 4. Build router
+    let app = router::build_router(state);
+
+    // 5. Bind listener (Unix socket if IX_SOCKET is set, otherwise TCP)
+    if let Some(ref socket_path) = socket {
+        let _ = std::fs::remove_file(socket_path);
+        let listener = tokio::net::UnixListener::bind(socket_path)
+            .unwrap_or_else(|e| panic!("failed to bind to {socket_path}: {e}"));
+        // Allow non-root host users to connect through the bind mount.
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o666));
+        info!(path = %socket_path, "ixd listening on unix socket");
+
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal())
+            .await
+            .unwrap_or_else(|e| error!(error = %e, "server error"));
+    } else {
+        let listener = tokio::net::TcpListener::bind(&addr)
+            .await
+            .unwrap_or_else(|e| panic!("failed to bind to {addr}: {e}"));
+        info!(addr = %addr, "ixd listening");
+
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal())
+            .await
+            .unwrap_or_else(|e| error!(error = %e, "server error"));
+    }
+
+    // 7. Cleanup on shutdown
+    info!("shutting down...");
+    kernels.shutdown().await;
+    if let Some(egress) = egress {
+        if let Ok(filter) = Arc::try_unwrap(egress) {
+            filter.shutdown().await;
+        }
+    }
+    browser.shutdown().await;
+    info!("ixd stopped");
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => info!("received Ctrl+C"),
+        _ = terminate => info!("received SIGTERM"),
+    }
+}
