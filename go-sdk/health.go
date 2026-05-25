@@ -5,11 +5,8 @@ import (
 	"fmt"
 	"maps"
 	"net/http"
-	"os"
-	"path/filepath"
 	"time"
 
-	"github.com/docker/docker/api/types/container"
 	"github.com/google/uuid"
 )
 
@@ -61,8 +58,8 @@ func (m *IXManager) monitor(ctx context.Context) {
 	}
 }
 
-// restart destroys the old sandbox container and replaces it with a fresh one,
-// preserving the session ID and incrementing the restart counter.
+// restart kills the old VM process, removes the old socket dir, and starts
+// a fresh Firecracker VM for the same session ID, preserving the restart count.
 func (m *IXManager) restart(ctx context.Context, sessionID string) {
 	m.mu.Lock()
 	old, ok := m.sandboxes[sessionID]
@@ -70,8 +67,7 @@ func (m *IXManager) restart(ctx context.Context, sessionID string) {
 		m.mu.Unlock()
 		return
 	}
-	oldContainerID := old.containerID
-	oldNetworkID := old.networkID
+	oldVMM := old.vmm
 	oldRestartCount := old.restartCount
 	remainingTTL := time.Until(old.expiresAt)
 	if remainingTTL < 0 {
@@ -79,97 +75,50 @@ func (m *IXManager) restart(ctx context.Context, sessionID string) {
 	}
 	m.mu.Unlock()
 
-	// Destroy old container + network + socket dir.
+	// Kill old VM and clean up.
 	old.Close()
-	_ = m.destroyContainer(ctx, oldContainerID, oldNetworkID)
-	if old.socketDir != "" {
-		_ = os.RemoveAll(old.socketDir)
-	}
+	m.vmm.cleanup(oldVMM)
 
-	// Create replacement.
+	// Create replacement VM.
 	sandboxID := uuid.NewString()[:12]
 	now := time.Now()
 
-	networkID, networkName, err := m.allocateNetwork(ctx, sandboxID, sessionID)
+	vcpus := m.cfg.PerSandbox.VCPUs
+	if vcpus < 1 {
+		vcpus = 1
+	}
+	memMB := m.cfg.PerSandbox.Memory >> 20
+	if memMB < 128 {
+		memMB = 128
+	}
+
+	envSlice := m.buildEnvSlice(nil)
+
+	handle, err := m.vmm.startVM(ctx, sandboxID, vcpus, memMB, envSlice)
 	if err != nil {
-		m.logger.Error("restart: allocate network failed", "session", sessionID, "error", err)
+		m.logger.Error("restart: start VM failed", "session", sessionID, "error", err)
 		return
 	}
 
-	socketDir := filepath.Join(os.TempDir(), "ix-"+sandboxID)
-	if err := os.MkdirAll(socketDir, 0o777); err != nil {
-		m.cleanupNetwork(ctx, networkID)
-		m.logger.Error("restart: create socket dir failed", "session", sessionID, "error", err)
-		return
-	}
-	_ = os.Chmod(socketDir, 0o777)
-	socketPath := filepath.Join(socketDir, "daemon.sock")
-
-	var pidsLimit int64 = 256
-	hostCfg := &container.HostConfig{
-		Runtime: m.cfg.Runtime,
-		Resources: container.Resources{
-			Memory:    m.cfg.PerSandbox.Memory,
-			CPUQuota:  int64(m.cfg.PerSandbox.CPU) * 100000,
-			CPUPeriod: 100000,
-			PidsLimit: &pidsLimit,
-		},
-		NetworkMode: container.NetworkMode(networkName),
-		Binds:       []string{socketDir + ":/run/ix"},
-		RestartPolicy: container.RestartPolicy{
-			Name: container.RestartPolicyDisabled,
-		},
-		SecurityOpt: []string{"no-new-privileges:true"},
-		CapDrop:     []string{"ALL"},
-		CapAdd:      []string{"CHOWN", "SETUID", "SETGID", "KILL", "NET_BIND_SERVICE"},
+	if m.vmm.snapshot == nil || !m.vmm.snapshot.Ready() {
+		if err := m.vmm.waitReady(ctx, handle); err != nil {
+			m.vmm.cleanup(handle)
+			m.logger.Error("restart: wait ready failed", "session", sessionID, "error", err)
+			return
+		}
 	}
 
-	containerCfg := &container.Config{
-		Image: m.cfg.Image,
-		Env:   []string{"IX_SOCKET=/run/ix/daemon.sock"},
-		Labels: map[string]string{
-			"oasis.sandbox": "true",
-			"oasis.session": sessionID,
-			"oasis.created": now.Format(time.RFC3339),
-			"oasis.expires": now.Add(remainingTTL).Format(time.RFC3339),
-		},
-	}
-
-	resp, err := m.docker.ContainerCreate(ctx, containerCfg, hostCfg, nil, nil, "sandbox-"+sandboxID)
-	if err != nil {
-		m.cleanupNetwork(ctx, networkID)
-		_ = os.RemoveAll(socketDir)
-		m.logger.Error("restart: create container failed", "session", sessionID, "error", err)
-		return
-	}
-
-	if err := m.docker.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
-		_ = m.docker.ContainerRemove(ctx, resp.ID, container.RemoveOptions{Force: true})
-		m.cleanupNetwork(ctx, networkID)
-		_ = os.RemoveAll(socketDir)
-		m.logger.Error("restart: start container failed", "session", sessionID, "error", err)
-		return
-	}
-
-	socketTransport := unixSocketTransport(socketPath)
-	if err := m.waitReady(ctx, "http://localhost", socketTransport, socketPath); err != nil {
-		_ = m.destroyContainer(ctx, resp.ID, networkID)
-		_ = os.RemoveAll(socketDir)
-		m.logger.Error("restart: wait ready failed", "session", sessionID, "error", err)
-		return
-	}
-
-	httpClient := &http.Client{Transport: socketTransport, Timeout: 2 * time.Minute}
+	transport := vsockTransport(handle.VsockPath)
+	httpClient := &http.Client{Transport: transport, Timeout: 2 * time.Minute}
 	newSb := &IXSandbox{
 		id:           sessionID,
-		containerID:  resp.ID,
+		vmm:          handle,
 		baseURL:      "http://localhost",
 		client:       newClient("http://localhost", httpClient),
-		networkID:    networkID,
-		socketDir:    socketDir,
 		createdAt:    now,
 		expiresAt:    now.Add(remainingTTL),
 		restartCount: oldRestartCount + 1,
+		shellSession: "default",
 	}
 
 	m.mu.Lock()
@@ -178,7 +127,7 @@ func (m *IXManager) restart(ctx context.Context, sessionID string) {
 
 	m.logger.Info("sandbox restarted",
 		"session", sessionID,
-		"container", resp.ID[:12],
+		"pid", handle.Process.Pid,
 		"restartCount", newSb.restartCount,
 	)
 }

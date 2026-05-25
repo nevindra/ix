@@ -236,13 +236,11 @@ func newTestSandbox(t *testing.T) (*IXSandbox, *httptest.Server) {
 	t.Cleanup(srv.Close)
 
 	s := &IXSandbox{
-		id:          "test-session",
-		containerID: "test-container-123",
-		baseURL:     srv.URL,
-		client:      newClient(srv.URL, srv.Client()),
-		networkID:   "test-network",
-		createdAt:   time.Now(),
-		expiresAt:   time.Now().Add(time.Hour),
+		id:        "test-session",
+		baseURL:   srv.URL,
+		client:    newClient(srv.URL, srv.Client()),
+		createdAt: time.Now(),
+		expiresAt: time.Now().Add(time.Hour),
 	}
 	return s, srv
 }

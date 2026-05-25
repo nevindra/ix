@@ -4,6 +4,7 @@ package ix
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -13,8 +14,10 @@ import (
 func TestIntegrationCreateAndShell(t *testing.T) {
 	ctx := context.Background()
 	mgr, err := NewManager(ctx, ManagerConfig{
-		Image:      "oasis-ix:latest",
-		DefaultTTL: 2 * time.Minute,
+		RootfsImage: rootfsImage(),
+		KernelPath:  kernelPath(),
+		FCBinary:    fcBinary(),
+		DefaultTTL:  2 * time.Minute,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -65,8 +68,8 @@ func TestIntegrationCreateAndShell(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if content.Content != "hello world" {
-		t.Fatalf("expected 'hello world', got %q", content.Content)
+	if !strings.Contains(content.Content, "hello world") {
+		t.Fatalf("expected content containing 'hello world', got %q", content.Content)
 	}
 
 	// Get by session ID

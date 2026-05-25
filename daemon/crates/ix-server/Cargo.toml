@@ -33,6 +33,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tower-http = { version = "0.6", features = ["cors"] }
 axum-extra = { version = "0.10", features = ["multipart"] }
 tokio-util = { version = "0.7", features = ["io"] }
+tokio-vsock = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }

@@ -16,3 +16,5 @@ Thumbs.db
 
 # Snapshots (generated)
 codedb.snapshot
+rootfs/
+go-sdk/cmd/ix-vmm/ix-vmm

@@ -3,17 +3,15 @@ package ix
 import (
 	"context"
 	"maps"
+	"os"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
-
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/filters"
-	"github.com/docker/docker/api/types/network"
 )
 
 // reaper periodically destroys expired sandboxes and evicts the oldest
-// sandbox when host disk space on /var/lib/docker drops below 5 GB.
+// sandbox when host disk space on the rootfs path falls below 5 GB.
 func (m *IXManager) reaper(ctx context.Context) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
@@ -46,10 +44,10 @@ func (m *IXManager) reapExpired(ctx context.Context) {
 	}
 }
 
-// reapDisk evicts the oldest sandbox when free disk space on /var/lib/docker
-// falls below 5 GB.
+// reapDisk evicts the oldest sandbox when free disk space on the rootfs image
+// path falls below 5 GB.
 func (m *IXManager) reapDisk(ctx context.Context) {
-	if diskFreeGB("/var/lib/docker") >= 5 {
+	if diskFreeGB(m.cfg.RootfsImage) >= 5 {
 		return
 	}
 
@@ -70,149 +68,57 @@ func (m *IXManager) reapDisk(ctx context.Context) {
 
 	m.logger.Warn("reaper: low disk space, evicting oldest sandbox",
 		"session", oldestSID,
-		"freeGB", diskFreeGB("/var/lib/docker"),
+		"freeGB", diskFreeGB(m.cfg.RootfsImage),
 	)
 	if err := m.destroy(ctx, oldestSID); err != nil {
 		m.logger.Warn("reaper: evict failed", "session", oldestSID, "error", err)
 	}
 }
 
-// recover reclaims running sandbox containers from a previous manager
-// instance, destroys expired or stopped containers, and sweeps orphaned
-// networks.
+// recover scans /tmp for orphaned ix-* socket directories left by a previous
+// manager instance and removes them. VM process recovery is not supported in
+// Phase 1 — we cannot reliably identify which processes belong to us across
+// restarts without a process registry.
 func (m *IXManager) recover(ctx context.Context) error {
-	containers, err := m.docker.ContainerList(ctx, container.ListOptions{
-		All: true,
-		Filters: filters.NewArgs(
-			filters.Arg("label", "oasis.sandbox=true"),
-		),
-	})
+	m.logger.Info("recover: process-based recovery not supported in Phase 1, cleaning up orphaned socket dirs")
+
+	// Collect dirs that must not be removed: active sandboxes + snapshot dir.
+	active := make(map[string]bool)
+	m.mu.RLock()
+	for _, sb := range m.sandboxes {
+		if sb.vmm != nil && sb.vmm.SocketDir != "" {
+			active[sb.vmm.SocketDir] = true
+		}
+	}
+	m.mu.RUnlock()
+	if m.cfg.SnapshotDir != "" {
+		active[m.cfg.SnapshotDir] = true
+	}
+
+	tmpDir := os.TempDir()
+	entries, err := os.ReadDir(tmpDir)
 	if err != nil {
-		return err
+		return nil // non-fatal
 	}
 
-	for _, c := range containers {
-		expiresStr := c.Labels["oasis.expires"]
-		sessionID := c.Labels["oasis.session"]
-		networkID := m.networkIDFromContainer(c)
-
-		// Destroy stale pool containers — they may have accumulated state.
-		if c.Labels["oasis.pool"] == "true" {
-			m.logger.Info("recover: destroying stale pool container",
-				"container", c.ID[:12],
-			)
-			_ = m.destroyContainer(ctx, c.ID, networkID)
+	for _, entry := range entries {
+		if !entry.IsDir() {
 			continue
 		}
-
-		expires, parseErr := time.Parse(time.RFC3339, expiresStr)
-		expired := parseErr != nil || time.Now().After(expires)
-		running := c.State == container.StateRunning
-
-		if expired || !running {
-			m.logger.Info("recover: destroying stale container",
-				"container", c.ID[:12],
-				"session", sessionID,
-				"expired", expired,
-				"running", running,
-			)
-			_ = m.destroyContainer(ctx, c.ID, networkID)
+		if !strings.HasPrefix(entry.Name(), "ix-") {
 			continue
 		}
-
-		// Reclaim: resolve connection (auto-detects socket vs TCP), register.
-		conn, err := m.resolveConnection(ctx, c.ID)
-		if err != nil {
-			m.logger.Warn("recover: resolve connection failed, destroying",
-				"container", c.ID[:12],
-				"error", err,
-			)
-			_ = m.destroyContainer(ctx, c.ID, networkID)
+		fullPath := filepath.Join(tmpDir, entry.Name())
+		if active[fullPath] {
 			continue
 		}
-
-		// Acquire semaphore slot.
-		select {
-		case m.semaphore <- struct{}{}:
-		default:
-			m.logger.Warn("recover: no capacity, destroying container",
-				"container", c.ID[:12],
-				"session", sessionID,
-			)
-			_ = m.destroyContainer(ctx, c.ID, networkID)
-			continue
+		m.logger.Info("recover: removing orphaned socket dir", "path", fullPath)
+		if err := os.RemoveAll(fullPath); err != nil {
+			m.logger.Warn("recover: remove failed", "path", fullPath, "error", err)
 		}
-
-		sb := &IXSandbox{
-			id:          sessionID,
-			containerID: c.ID,
-			baseURL:     conn.baseURL,
-			client:      newClient(conn.baseURL, conn.httpClient),
-			networkID:   networkID,
-			socketDir:   conn.socketDir,
-			createdAt:   time.Unix(c.Created, 0),
-			expiresAt:   expires,
-		}
-
-		m.mu.Lock()
-		m.sandboxes[sessionID] = sb
-		m.mu.Unlock()
-
-		m.logger.Info("recover: reclaimed sandbox",
-			"session", sessionID,
-			"container", c.ID[:12],
-			"expiresIn", time.Until(expires).Round(time.Second),
-		)
 	}
-
-	// Sweep orphaned networks with "sandbox-" prefix.
-	m.sweepOrphanedNetworks(ctx)
 
 	return nil
-}
-
-// sweepOrphanedNetworks removes networks with a "sandbox-" name prefix that
-// have no attached containers.
-func (m *IXManager) sweepOrphanedNetworks(ctx context.Context) {
-	networks, err := m.docker.NetworkList(ctx, network.ListOptions{})
-	if err != nil {
-		m.logger.Warn("recover: list networks failed", "error", err)
-		return
-	}
-
-	for _, n := range networks {
-		if !strings.HasPrefix(n.Name, "sandbox-") {
-			continue
-		}
-		if len(n.Containers) == 0 {
-			m.logger.Info("recover: removing orphaned network",
-				"network", n.Name,
-				"id", n.ID[:12],
-			)
-			if err := m.docker.NetworkRemove(ctx, n.ID); err != nil {
-				m.logger.Warn("recover: network remove failed",
-					"network", n.Name,
-					"error", err,
-				)
-			}
-		}
-	}
-}
-
-// networkIDFromContainer extracts the network ID from a container's network
-// mode (HostConfig) name. Falls back to empty string.
-func (m *IXManager) networkIDFromContainer(c container.Summary) string {
-	netMode := c.HostConfig.NetworkMode
-	if netMode == "" || !strings.HasPrefix(netMode, "sandbox-") {
-		return ""
-	}
-	// The network name is the network mode for user-defined bridge networks.
-	// We need the network ID, so inspect it.
-	info, err := m.docker.NetworkInspect(context.Background(), netMode, network.InspectOptions{})
-	if err != nil {
-		return ""
-	}
-	return info.ID
 }
 
 // diskFreeGB returns the free disk space in gigabytes at the given path.

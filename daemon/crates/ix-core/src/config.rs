@@ -6,12 +6,16 @@ pub struct DaemonConfig {
     pub workspace: String,
     pub egress: EgressPolicy,
     pub socket: Option<String>,
+    pub vsock_port: Option<u32>,
+    pub vsock_ready_port: Option<u32>,
 }
 
 impl DaemonConfig {
     pub fn from_env() -> Self {
         let addr = std::env::var("IX_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
         let socket = std::env::var("IX_SOCKET").ok();
+        let vsock_port = std::env::var("IX_VSOCK_PORT").ok().and_then(|v| v.parse().ok());
+        let vsock_ready_port = std::env::var("IX_VSOCK_READY_PORT").ok().and_then(|v| v.parse().ok());
         let workspace =
             std::env::var("IX_WORKSPACE").unwrap_or_else(|_| "/workspace".to_string());
 
@@ -38,6 +42,8 @@ impl DaemonConfig {
             addr,
             workspace,
             socket,
+            vsock_port,
+            vsock_ready_port,
             egress: EgressPolicy {
                 enabled: egress_enabled,
                 mode,

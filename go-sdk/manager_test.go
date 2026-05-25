@@ -12,20 +12,14 @@ func TestDefaultManagerConfig(t *testing.T) {
 	cfg := ManagerConfig{}
 	cfg.applyDefaults()
 
-	if cfg.Image != "ghcr.io/nevindra/ix:full" {
-		t.Errorf("Image = %q, want %q", cfg.Image, "ghcr.io/nevindra/ix:full")
-	}
 	if cfg.DefaultTTL != time.Hour {
 		t.Errorf("DefaultTTL = %v, want %v", cfg.DefaultTTL, time.Hour)
 	}
-	if cfg.PerSandbox.CPU != 1 {
-		t.Errorf("PerSandbox.CPU = %d, want 1", cfg.PerSandbox.CPU)
+	if cfg.PerSandbox.VCPUs != 1 {
+		t.Errorf("PerSandbox.VCPUs = %d, want 1", cfg.PerSandbox.VCPUs)
 	}
-	if cfg.PerSandbox.Memory != 2<<30 {
-		t.Errorf("PerSandbox.Memory = %d, want %d", cfg.PerSandbox.Memory, 2<<30)
-	}
-	if cfg.PerSandbox.Disk != 10<<30 {
-		t.Errorf("PerSandbox.Disk = %d, want %d", cfg.PerSandbox.Disk, 10<<30)
+	if cfg.PerSandbox.Memory != 512<<20 {
+		t.Errorf("PerSandbox.Memory = %d, want %d", cfg.PerSandbox.Memory, 512<<20)
 	}
 	if cfg.MaxRestarts != 3 {
 		t.Errorf("MaxRestarts = %d, want 3", cfg.MaxRestarts)
@@ -37,31 +31,23 @@ func TestDefaultManagerConfig(t *testing.T) {
 
 func TestDefaultManagerConfigPreservesExplicit(t *testing.T) {
 	cfg := ManagerConfig{
-		Image:      "custom-image:v1",
 		DefaultTTL: 30 * time.Minute,
-		PerSandbox: sandbox.ResourceSpec{
-			CPU:    4,
-			Memory: 8 << 30,
-			Disk:   20 << 30,
+		PerSandbox: ResourceSpec{
+			VCPUs:  4,
+			Memory: 2 << 30,
 		},
 		MaxRestarts: 5,
 	}
 	cfg.applyDefaults()
 
-	if cfg.Image != "custom-image:v1" {
-		t.Errorf("Image = %q, want %q", cfg.Image, "custom-image:v1")
-	}
 	if cfg.DefaultTTL != 30*time.Minute {
 		t.Errorf("DefaultTTL = %v, want %v", cfg.DefaultTTL, 30*time.Minute)
 	}
-	if cfg.PerSandbox.CPU != 4 {
-		t.Errorf("PerSandbox.CPU = %d, want 4", cfg.PerSandbox.CPU)
+	if cfg.PerSandbox.VCPUs != 4 {
+		t.Errorf("PerSandbox.VCPUs = %d, want 4", cfg.PerSandbox.VCPUs)
 	}
-	if cfg.PerSandbox.Memory != 8<<30 {
-		t.Errorf("PerSandbox.Memory = %d, want %d", cfg.PerSandbox.Memory, 8<<30)
-	}
-	if cfg.PerSandbox.Disk != 20<<30 {
-		t.Errorf("PerSandbox.Disk = %d, want %d", cfg.PerSandbox.Disk, 20<<30)
+	if cfg.PerSandbox.Memory != 2<<30 {
+		t.Errorf("PerSandbox.Memory = %d, want %d", cfg.PerSandbox.Memory, 2<<30)
 	}
 	if cfg.MaxRestarts != 5 {
 		t.Errorf("MaxRestarts = %d, want 5", cfg.MaxRestarts)
@@ -70,49 +56,36 @@ func TestDefaultManagerConfigPreservesExplicit(t *testing.T) {
 
 func TestResolveOpts(t *testing.T) {
 	cfg := ManagerConfig{
-		Image:      "default-image:latest",
 		DefaultTTL: time.Hour,
-		PerSandbox: sandbox.ResourceSpec{
-			CPU:    2,
-			Memory: 4 << 30,
-			Disk:   10 << 30,
+		PerSandbox: ResourceSpec{
+			VCPUs:  2,
+			Memory: 1 << 30,
 		},
 	}
 	m := &IXManager{cfg: cfg}
 
 	t.Run("all defaults", func(t *testing.T) {
 		resolved := m.resolveOpts(sandbox.CreateOpts{SessionID: "s1"})
-		if resolved.Image != "default-image:latest" {
-			t.Errorf("Image = %q, want %q", resolved.Image, "default-image:latest")
-		}
 		if resolved.TTL != time.Hour {
 			t.Errorf("TTL = %v, want %v", resolved.TTL, time.Hour)
 		}
 		if resolved.Resources.CPU != 2 {
 			t.Errorf("CPU = %d, want 2", resolved.Resources.CPU)
 		}
-		if resolved.Resources.Memory != 4<<30 {
-			t.Errorf("Memory = %d, want %d", resolved.Resources.Memory, 4<<30)
-		}
-		if resolved.Resources.Disk != 10<<30 {
-			t.Errorf("Disk = %d, want %d", resolved.Resources.Disk, 10<<30)
+		if resolved.Resources.Memory != 1<<30 {
+			t.Errorf("Memory = %d, want %d", resolved.Resources.Memory, 1<<30)
 		}
 	})
 
 	t.Run("explicit overrides", func(t *testing.T) {
 		resolved := m.resolveOpts(sandbox.CreateOpts{
 			SessionID: "s2",
-			Image:     "custom:v2",
 			TTL:       30 * time.Minute,
 			Resources: sandbox.ResourceSpec{
 				CPU:    8,
 				Memory: 16 << 30,
-				Disk:   50 << 30,
 			},
 		})
-		if resolved.Image != "custom:v2" {
-			t.Errorf("Image = %q, want %q", resolved.Image, "custom:v2")
-		}
 		if resolved.TTL != 30*time.Minute {
 			t.Errorf("TTL = %v, want %v", resolved.TTL, 30*time.Minute)
 		}
@@ -122,20 +95,13 @@ func TestResolveOpts(t *testing.T) {
 		if resolved.Resources.Memory != 16<<30 {
 			t.Errorf("Memory = %d, want %d", resolved.Resources.Memory, 16<<30)
 		}
-		if resolved.Resources.Disk != 50<<30 {
-			t.Errorf("Disk = %d, want %d", resolved.Resources.Disk, 50<<30)
-		}
 	})
 
 	t.Run("partial overrides", func(t *testing.T) {
 		resolved := m.resolveOpts(sandbox.CreateOpts{
 			SessionID: "s3",
-			Image:     "partial:v1",
-			// TTL and Resources left at zero - should use defaults.
+			// TTL and Resources left at zero — should use defaults.
 		})
-		if resolved.Image != "partial:v1" {
-			t.Errorf("Image = %q, want %q", resolved.Image, "partial:v1")
-		}
 		if resolved.TTL != time.Hour {
 			t.Errorf("TTL = %v, want %v", resolved.TTL, time.Hour)
 		}
@@ -215,9 +181,9 @@ func TestAcquireSlotContextCanceled(t *testing.T) {
 }
 
 func TestAutoDetectMax(t *testing.T) {
-	result := autoDetectMax(sandbox.ResourceSpec{
-		CPU:    1,
-		Memory: 2 << 30, // 2 GB
+	result := autoDetectMax(ResourceSpec{
+		VCPUs:  1,
+		Memory: 512 << 20, // 512 MB
 	})
 
 	// Should return at least 1 on any machine.
@@ -226,8 +192,8 @@ func TestAutoDetectMax(t *testing.T) {
 	}
 
 	// With very large resource requirements, should still return at least 1.
-	result = autoDetectMax(sandbox.ResourceSpec{
-		CPU:    1024,
+	result = autoDetectMax(ResourceSpec{
+		VCPUs:  1024,
 		Memory: 1 << 40, // 1 TB
 	})
 	if result != 1 {
@@ -237,8 +203,8 @@ func TestAutoDetectMax(t *testing.T) {
 
 func TestAutoDetectMaxZeroResources(t *testing.T) {
 	// Zero values should not cause division by zero.
-	result := autoDetectMax(sandbox.ResourceSpec{
-		CPU:    0,
+	result := autoDetectMax(ResourceSpec{
+		VCPUs:  0,
 		Memory: 0,
 	})
 	if result < 1 {
