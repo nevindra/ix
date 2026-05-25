@@ -46,20 +46,22 @@ RUN curl -fsSL https://fnm.vercel.app/install | bash -s -- --install-dir /root/.
     eval "$(fnm env)" && \
     fnm install 25 && \
     fnm default 25 && \
-    corepack enable pnpm
+    export PATH="/root/.local/share/fnm/aliases/default/bin:$PATH" && \
+    npm install -g pnpm
 ENV PATH="/root/.local/share/fnm/aliases/default/bin:${PATH}"
 ENV PNPM_HOME=/root/.local/share/pnpm
-ENV PATH="${PNPM_HOME}:${PATH}"
+ENV PATH="${PNPM_HOME}:${PNPM_HOME}/bin:${PATH}"
 
 # Google Chrome
-RUN curl -fsSL https://dl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg && \
+RUN apt-get update && apt-get install -y --no-install-recommends gnupg && \
+    curl -fsSL https://dl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg && \
     echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list && \
     apt-get update && apt-get install -y --no-install-recommends google-chrome-stable && \
     rm -rf /var/lib/apt/lists/*
 ENV CHROME_BIN=/usr/bin/google-chrome-stable
 
 # Pinchtab browser bridge
-COPY --from=pinchtab/pinchtab:latest /pinchtab /usr/local/bin/pinchtab
+COPY --from=pinchtab/pinchtab:latest /usr/local/bin/pinchtab /usr/local/bin/pinchtab
 
 # Node.js tools
 RUN pnpm add -g playwright-core

@@ -61,6 +61,9 @@ fn make_state(workspace: &str) -> Arc<AppState> {
         addr: "127.0.0.1:0".to_string(),
         workspace: workspace.to_string(),
         egress: ix_core::types::EgressPolicy::default(),
+        socket: None,
+        vsock_port: None,
+        vsock_ready_port: None,
     };
     Arc::new(AppState {
         config,

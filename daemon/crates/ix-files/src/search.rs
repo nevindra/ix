@@ -74,13 +74,16 @@ fn native_glob(
     let mut files = Vec::new();
     let mut truncated = false;
 
-    'walk: for entry in WalkDir::new(base).into_iter().filter_map(|e| e.ok()) {
-        // Skip excluded directories.
-        if let Some(name) = entry.file_name().to_str() {
-            if excludes.iter().any(|ex| ex == name) && entry.file_type().is_dir() {
-                continue;
+    let walker = WalkDir::new(base).into_iter().filter_entry(|e| {
+        if e.depth() > 0 && e.file_type().is_dir() {
+            if let Some(name) = e.file_name().to_str() {
+                return !excludes.iter().any(|ex| ex == name);
             }
         }
+        true
+    });
+
+    'walk: for entry in walker.filter_map(|e| e.ok()) {
         if entry.file_type().is_file() {
             let file_name = entry.file_name().to_string_lossy();
             if pat.matches(&file_name) {
@@ -269,64 +272,38 @@ pub async fn tree(req: TreeRequest) -> Result<TreeResult> {
         ]
     });
 
-    // Try the `tree` binary first.
-    if let Some(result) = try_tree_bin(&req.path, depth, &excludes).await {
-        return Ok(result);
+    // Always count with native walker (tree v2.0+ counts the root dir, giving
+    // inconsistent results across environments).
+    let mut result = native_tree(&req.path, depth, &excludes)?;
+
+    // Use tree binary for nicer formatted output when available.
+    if let Some(tree_str) = try_tree_bin_output(&req.path, depth, &excludes).await {
+        result.tree = tree_str;
     }
 
-    // Fallback: native walkdir.
-    native_tree(&req.path, depth, &excludes)
+    Ok(result)
 }
 
-async fn try_tree_bin(path: &str, depth: usize, excludes: &[String]) -> Option<TreeResult> {
+async fn try_tree_bin_output(path: &str, depth: usize, excludes: &[String]) -> Option<String> {
     if !which("tree") {
         return None;
     }
 
-    let pattern = excludes.join("|");
     let mut cmd = Command::new("tree");
     cmd.arg("-L")
         .arg(depth.to_string())
-        .arg("--dirsfirst")
-        .arg("-I")
-        .arg(&pattern)
-        .arg(path);
+        .arg("--dirsfirst");
+    if !excludes.is_empty() {
+        cmd.arg("-I").arg(excludes.join("|"));
+    }
+    cmd.arg(path);
 
     let out = cmd.output().await.ok()?;
     if !out.status.success() {
         return None;
     }
 
-    let tree_str = String::from_utf8_lossy(&out.stdout).to_string();
-
-    // Parse summary line: "N directories, M files"
-    let (dirs, files) = parse_tree_summary(&tree_str);
-
-    Some(TreeResult {
-        tree: tree_str,
-        files,
-        dirs,
-    })
-}
-
-fn parse_tree_summary(tree_str: &str) -> (usize, usize) {
-    // Last line looks like: "3 directories, 7 files"
-    let last = tree_str.trim_end().lines().last().unwrap_or("");
-    let dirs = extract_count(last, "director");
-    let files = extract_count(last, "file");
-    (dirs, files)
-}
-
-fn extract_count(line: &str, keyword: &str) -> usize {
-    for part in line.split(',') {
-        let part = part.trim();
-        if part.contains(keyword) {
-            if let Some(n) = part.split_whitespace().next() {
-                return n.parse().unwrap_or(0);
-            }
-        }
-    }
-    0
+    Some(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
 fn native_tree(base: &str, depth: usize, excludes: &[String]) -> Result<TreeResult> {
