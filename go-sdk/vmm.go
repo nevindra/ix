@@ -95,11 +95,11 @@ type firecrackerBackend struct {
 // startVM is the primary VM-creation entry point.  When a SnapshotManager is
 // attached and has a ready golden snapshot, it delegates to snapshot.Restore for
 // ~10x faster VM startup.  Otherwise it falls back to a full cold boot.
-func (fb *firecrackerBackend) startVM(ctx context.Context, sandboxID string, vcpus int, memMB int64, envSlice []string) (*VMMHandle, error) {
-	if fb.snapshot != nil && fb.snapshot.Ready() {
+func (fb *firecrackerBackend) startVM(ctx context.Context, sandboxID string, vcpus int, memMB int64, rootfsImage string, envSlice []string) (*VMMHandle, error) {
+	if fb.snapshot != nil && fb.snapshot.Ready() && rootfsImage == fb.rootfsImage {
 		return fb.snapshot.Restore(ctx, sandboxID)
 	}
-	return fb.startVMCold(ctx, sandboxID, vcpus, memMB, envSlice)
+	return fb.startVMCold(ctx, sandboxID, vcpus, memMB, rootfsImage, envSlice)
 }
 
 // startVMCold launches a Firecracker VM and returns a VMMHandle on success.
@@ -114,7 +114,7 @@ func (fb *firecrackerBackend) startVM(ctx context.Context, sandboxID string, vcp
 //
 // On any error after process creation, the process and passt are killed and
 // the socket dir is removed before returning.
-func (fb *firecrackerBackend) startVMCold(ctx context.Context, sandboxID string, vcpus int, memMB int64, envSlice []string) (*VMMHandle, error) {
+func (fb *firecrackerBackend) startVMCold(ctx context.Context, sandboxID string, vcpus int, memMB int64, rootfsImage string, envSlice []string) (*VMMHandle, error) {
 	cid := allocateCID()
 
 	socketDir := filepath.Join(os.TempDir(), "ix-"+sandboxID)
@@ -173,7 +173,7 @@ func (fb *firecrackerBackend) startVMCold(ctx context.Context, sandboxID string,
 	// Configure: rootfs drive.
 	if err := fcPut(ctx, apiClient, "/drives/rootfs", map[string]any{
 		"drive_id":       "rootfs",
-		"path_on_host":   fb.rootfsImage,
+		"path_on_host":   rootfsImage,
 		"is_root_device": true,
 		"is_read_only":   false,
 	}); err != nil {

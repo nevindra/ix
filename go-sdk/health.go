@@ -94,7 +94,7 @@ func (m *IXManager) restart(ctx context.Context, sessionID string) {
 
 	envSlice := m.buildEnvSlice(nil)
 
-	handle, err := m.vmm.startVM(ctx, sandboxID, vcpus, memMB, envSlice)
+	handle, err := m.vmm.startVM(ctx, sandboxID, vcpus, memMB, m.cfg.RootfsImage, envSlice)
 	if err != nil {
 		m.logger.Error("restart: start VM failed", "session", sessionID, "error", err)
 		return

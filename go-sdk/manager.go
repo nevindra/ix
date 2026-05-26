@@ -196,8 +196,11 @@ func (m *IXManager) Create(ctx context.Context, opts sandbox.CreateOpts) (sandbo
 
 	resolved := m.resolveOpts(opts)
 
-	// Try to grab a pre-warmed VM from the pool.
-	entry := m.grabFromPool()
+	// Pool entries use the default rootfs — only use pool when the image matches.
+	var entry *poolEntry
+	if resolved.Image == m.cfg.RootfsImage {
+		entry = m.grabFromPool()
+	}
 	if entry != nil {
 		// Fast path: VM already running and ready.
 		now := time.Now()
@@ -246,11 +249,11 @@ func (m *IXManager) Create(ctx context.Context, opts sandbox.CreateOpts) (sandbo
 	now := time.Now()
 	ttl := resolved.TTL
 
-	vcpus := m.cfg.PerSandbox.VCPUs
+	vcpus := resolved.Resources.CPU
 	if vcpus < 1 {
 		vcpus = 1
 	}
-	memMB := m.cfg.PerSandbox.Memory >> 20
+	memMB := resolved.Resources.Memory >> 20
 	if memMB < 128 {
 		memMB = 128
 	}
@@ -259,7 +262,7 @@ func (m *IXManager) Create(ctx context.Context, opts sandbox.CreateOpts) (sandbo
 	envSlice := m.buildEnvSlice(resolved.Env)
 
 	// Launch Firecracker VM.
-	handle, err := m.vmm.startVM(ctx, sandboxID, vcpus, memMB, envSlice)
+	handle, err := m.vmm.startVM(ctx, sandboxID, vcpus, memMB, resolved.Image, envSlice)
 	if err != nil {
 		m.releaseSlot()
 		return nil, fmt.Errorf("start VM: %w", err)
@@ -380,11 +383,17 @@ func (m *IXManager) resolveOpts(opts sandbox.CreateOpts) sandbox.CreateOpts {
 	if opts.TTL == 0 {
 		opts.TTL = m.cfg.DefaultTTL
 	}
+	if opts.Image == "" {
+		opts.Image = m.cfg.RootfsImage
+	}
 	if opts.Resources.CPU == 0 {
 		opts.Resources.CPU = m.cfg.PerSandbox.VCPUs
 	}
 	if opts.Resources.Memory == 0 {
 		opts.Resources.Memory = m.cfg.PerSandbox.Memory
+	}
+	if opts.Resources.Disk == 0 {
+		opts.Resources.Disk = 10 << 30 // 10 GB default
 	}
 	return opts
 }
@@ -617,7 +626,7 @@ func (m *IXManager) createPoolEntry(ctx context.Context) (*poolEntry, error) {
 
 	envSlice := m.buildEnvSlice(nil)
 
-	handle, err := m.vmm.startVM(ctx, sandboxID, vcpus, memMB, envSlice)
+	handle, err := m.vmm.startVM(ctx, sandboxID, vcpus, memMB, m.cfg.RootfsImage, envSlice)
 	if err != nil {
 		m.releaseSlot()
 		return nil, fmt.Errorf("pool start VM: %w", err)

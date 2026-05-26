@@ -322,7 +322,8 @@ func (s *IXSandbox) BrowserAction(ctx context.Context, action sandbox.BrowserAct
 		body["value"] = action.Value
 	}
 	var resp struct {
-		Success bool `json:"success"`
+		Success bool   `json:"success"`
+		Message string `json:"message"`
 		Result  struct {
 			Success bool `json:"success"`
 		} `json:"result"`
@@ -332,6 +333,7 @@ func (s *IXSandbox) BrowserAction(ctx context.Context, action sandbox.BrowserAct
 	}
 	return sandbox.BrowserResult{
 		Success: resp.Success,
+		Message: resp.Message,
 	}, nil
 }
 
@@ -350,6 +352,7 @@ func (s *IXSandbox) MCPCall(ctx context.Context, req sandbox.MCPRequest) (sandbo
 	}
 	return sandbox.MCPResult{
 		Content: resp.Content,
+		IsError: resp.IsError,
 	}, nil
 }
 

@@ -85,7 +85,7 @@ func (sm *SnapshotManager) CreateGolden(ctx context.Context) error {
 
 	sm.logger.Info("snapshot: booting golden VM")
 
-	handle, err := sm.backend.startVMCold(ctx, "golden-tmp", sm.vcpus, sm.memMB, nil)
+	handle, err := sm.backend.startVMCold(ctx, "golden-tmp", sm.vcpus, sm.memMB, sm.rootfsImage, nil)
 	if err != nil {
 		return fmt.Errorf("start golden VM: %w", err)
 	}
