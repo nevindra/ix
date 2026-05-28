@@ -100,8 +100,9 @@ func (sm *SnapshotManager) CreateGolden(ctx context.Context) error {
 
 	sm.logger.Info("snapshot: daemon ready, pre-warming Python kernel")
 
-	// Pre-warm the Python kernel before snapshotting. This boots ipykernel +
-	// ZMQ inside the VM so restored clones skip the ~15s kernel startup.
+	// Pre-warm the Python kernel before snapshotting: trigger a no-op execute
+	// so the daemon's pool has a live stdin/stdout REPL process baked into the
+	// snapshot. Restored clones skip the REPL spawn cost.
 	warmupTransport := vsockTransport(handle.VsockPath)
 	warmupHTTP := &http.Client{Transport: warmupTransport, Timeout: 2 * time.Minute}
 	warmupClient := newClient("http://localhost", warmupHTTP)

@@ -16,18 +16,14 @@ FROM ubuntu:24.04 AS base
 ENV DEBIAN_FRONTEND=noninteractive
 ENV LANG=C.UTF-8
 
-# System packages
+# Runtime system packages
 RUN apt-get update && apt-get install -y --no-install-recommends \
     bash ca-certificates curl git jq ripgrep fd-find unzip \
     python3 python3-pip python3-venv \
-    gcc python3-dev libffi-dev libjpeg-dev libpng-dev libcairo2-dev pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
-# uv (fast Python package installer)
+# uv (fast Python package installer, used by the full stage)
 COPY --from=ghcr.io/astral-sh/uv:0.11.2 /uv /usr/local/bin/uv
-
-# Jupyter kernel for code execution
-RUN uv pip install --system --break-system-packages ipykernel
 
 # Rust daemon binary
 COPY --from=builder /ixd /usr/local/bin/ixd
@@ -38,6 +34,11 @@ CMD ["ixd"]
 
 # Stage 3: Browser image (extends base)
 FROM base AS browser
+
+# Node.js runtime needs libatomic1 (previously pulled in transitively by gcc)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libatomic1 \
+    && rm -rf /var/lib/apt/lists/*
 
 # Node.js via fnm
 ENV FNM_DIR=/root/.local/share/fnm
@@ -69,11 +70,14 @@ RUN pnpm add -g playwright-core
 # Stage 4: Full image (extends browser)
 FROM browser AS full
 
-# Scientific Python packages
-RUN uv pip install --system --break-system-packages \
-    numpy pandas matplotlib seaborn Pillow \
-    python-docx openpyxl pypdf jinja2 cairosvg
-
-# Node.js document/chart tools
-RUN pnpm add -g \
-    pptxgenjs chartjs-node-canvas @mermaid-js/mermaid-cli sharp papaparse
+# Scientific Python packages (build deps installed and purged in same layer;
+# libcairo2 is installed explicitly so cairosvg can dlopen it at runtime)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        gcc python3-dev libffi-dev libjpeg-dev libpng-dev libcairo2-dev pkg-config \
+        libcairo2 \
+    && uv pip install --system --break-system-packages \
+        numpy pandas matplotlib seaborn Pillow \
+        python-docx openpyxl pypdf jinja2 cairosvg \
+    && apt-get purge -y gcc python3-dev libffi-dev libjpeg-dev libpng-dev libcairo2-dev pkg-config \
+    && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/*

@@ -56,7 +56,7 @@ docker run --shm-size=2g -p 8080:8080 <image>  # Chrome needs --shm-size=2g
 ix-server (binary: ixd)
 ├── ix-core      shared types, config, error → HTTP mapping, SSE channel primitives
 ├── ix-shell     bash execution with streaming, timeout, process group cleanup
-├── ix-code      polyglot REPL (Python/JS/Bash) via sentinel protocol + Jupyter wire protocol
+├── ix-code      polyglot REPL (Python/JS/Bash) via stdin/stdout sentinel protocol
 ├── ix-files     read/write/edit/glob/grep/tree/stat/upload/download
 ├── ix-fetch     HTTP fetch (raw or readable-text extraction) + web search (Startpage)
 ├── ix-egress    DNS-level egress firewall (allowlist/denylist with wildcard domains)
