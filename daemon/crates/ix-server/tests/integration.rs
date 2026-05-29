@@ -64,6 +64,8 @@ fn make_state(workspace: &str) -> Arc<AppState> {
         socket: None,
         vsock_port: None,
         vsock_ready_port: None,
+        browser_mode: ix_core::config::BrowserMode::Local,
+        chat_id: None,
     };
     Arc::new(AppState {
         config,

@@ -69,8 +69,29 @@ async fn main() {
     info!(addr = %addr, workspace = %config.workspace, "starting ixd");
 
     // 3. Create shared state
-    let browser = Arc::new(ix_browser::PinchtabBackend::new().await);
-    let browser_trait: Arc<dyn ix_browser::BrowserBackend> = browser.clone();
+    // Hold an optional PinchtabBackend so we can call its async shutdown later;
+    // the remote backend needs no shutdown.
+    let pinchtab: Option<Arc<ix_browser::PinchtabBackend>>;
+    let browser_trait: Arc<dyn ix_browser::BrowserBackend> = match &config.browser_mode {
+        ix_core::config::BrowserMode::Remote { gateway_url } => {
+            info!(%gateway_url, "using remote shared browser backend");
+            let chat_id = config.chat_id.clone().unwrap_or_default();
+            let token = std::env::var("IX_BROWSER_GATEWAY_TOKEN").ok();
+            pinchtab = None;
+            Arc::new(ix_browser::RemoteSharedBrowserBackend::new(
+                gateway_url.clone(),
+                chat_id,
+                &config.egress,
+                token,
+            ))
+        }
+        ix_core::config::BrowserMode::Local => {
+            let backend = Arc::new(ix_browser::PinchtabBackend::new().await);
+            let trait_obj: Arc<dyn ix_browser::BrowserBackend> = backend.clone();
+            pinchtab = Some(backend);
+            trait_obj
+        }
+    };
 
     let kernels = Arc::new(ix_code::KernelManager::new());
 
@@ -181,7 +202,9 @@ async fn main() {
             filter.shutdown().await;
         }
     }
-    browser.shutdown().await;
+    if let Some(pinchtab) = pinchtab {
+        pinchtab.shutdown().await;
+    }
     info!("ixd stopped");
 }
 

@@ -1,5 +1,13 @@
 use crate::types::EgressPolicy;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BrowserMode {
+    /// In-VM pinchtab (today's behaviour). Default.
+    Local,
+    /// Proxy browser calls to a shared Browser Gateway at this URL.
+    Remote { gateway_url: String },
+}
+
 #[derive(Debug, Clone)]
 pub struct DaemonConfig {
     pub addr: String,
@@ -8,6 +16,8 @@ pub struct DaemonConfig {
     pub socket: Option<String>,
     pub vsock_port: Option<u32>,
     pub vsock_ready_port: Option<u32>,
+    pub browser_mode: BrowserMode,
+    pub chat_id: Option<String>,
 }
 
 impl DaemonConfig {
@@ -38,6 +48,15 @@ impl DaemonConfig {
             _ => crate::types::PolicyMode::Allowlist,
         };
 
+        let browser_mode = match std::env::var("IX_BROWSER_MODE") {
+            Ok(v) if v.starts_with("remote=") => BrowserMode::Remote {
+                gateway_url: v["remote=".len()..].to_string(),
+            },
+            _ => BrowserMode::Local,
+        };
+
+        let chat_id = std::env::var("IX_CHAT_ID").ok().filter(|s| !s.is_empty());
+
         Self {
             addr,
             workspace,
@@ -49,6 +68,8 @@ impl DaemonConfig {
                 mode,
                 rules: egress_rules,
             },
+            browser_mode,
+            chat_id,
         }
     }
 }
@@ -71,6 +92,8 @@ mod tests {
         "IX_EGRESS_ENABLED",
         "IX_EGRESS_RULES",
         "IX_EGRESS_MODE",
+        "IX_BROWSER_MODE",
+        "IX_CHAT_ID",
     ];
 
     /// Run `f` with exactly the env vars in `vars` set (others from `ALL_KEYS`
@@ -184,5 +207,43 @@ mod tests {
             DaemonConfig::from_env,
         );
         assert!(cfg.egress.rules.is_empty());
+    }
+
+    #[test]
+    fn browser_mode_defaults_to_local() {
+        let cfg = with_env(&[], DaemonConfig::from_env);
+        assert_eq!(cfg.browser_mode, BrowserMode::Local);
+    }
+
+    #[test]
+    fn browser_mode_local_explicit() {
+        let cfg = with_env(&[("IX_BROWSER_MODE", "local")], DaemonConfig::from_env);
+        assert_eq!(cfg.browser_mode, BrowserMode::Local);
+    }
+
+    #[test]
+    fn browser_mode_remote_parses_url() {
+        let cfg = with_env(
+            &[("IX_BROWSER_MODE", "remote=http://169.254.0.1:9100")],
+            DaemonConfig::from_env,
+        );
+        assert_eq!(
+            cfg.browser_mode,
+            BrowserMode::Remote {
+                gateway_url: "http://169.254.0.1:9100".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn chat_id_parsed_from_env() {
+        let cfg = with_env(&[("IX_CHAT_ID", "chat-abc123")], DaemonConfig::from_env);
+        assert_eq!(cfg.chat_id.as_deref(), Some("chat-abc123"));
+    }
+
+    #[test]
+    fn chat_id_none_when_unset() {
+        let cfg = with_env(&[], DaemonConfig::from_env);
+        assert!(cfg.chat_id.is_none());
     }
 }

@@ -15,6 +15,9 @@ pub enum Error {
     #[error("service unavailable: {0}")]
     Unavailable(String),
 
+    #[error("forbidden: {0}")]
+    Forbidden(String),
+
     #[error("timeout: {0}")]
     Timeout(String),
 
@@ -32,6 +35,7 @@ impl IntoResponse for Error {
             Error::BadRequest(_) => StatusCode::BAD_REQUEST,
             Error::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Error::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            Error::Forbidden(_) => StatusCode::FORBIDDEN,
             Error::Timeout(_) => StatusCode::GATEWAY_TIMEOUT,
             Error::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Error::Json(_) => StatusCode::BAD_REQUEST,
@@ -140,5 +144,19 @@ mod tests {
             serde_json::from_str::<serde_json::Value>("{bad}").unwrap_err();
         let err: Error = json_err.into();
         assert!(matches!(err, Error::Json(_)));
+    }
+
+    #[test]
+    fn forbidden_maps_to_403() {
+        assert_eq!(
+            status_of(Error::Forbidden("egress denied: evil.com".into())),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[test]
+    fn error_message_preserved_in_forbidden() {
+        let err = Error::Forbidden("egress denied: evil.com".into());
+        assert!(err.to_string().contains("evil.com"));
     }
 }

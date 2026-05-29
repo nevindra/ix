@@ -350,7 +350,7 @@ impl Drop for PinchtabBackend {
 ///
 /// Extracted as a pure function so it can be unit-tested without a live HTTP
 /// server.
-pub(crate) fn build_snapshot_path(opts: &SnapshotOpts) -> String {
+pub fn build_snapshot_path(opts: &SnapshotOpts) -> String {
     let mut params = Vec::new();
     if let Some(ref filter) = opts.filter {
         params.push(format!("filter={}", urlencoding::encode(filter)));
@@ -373,7 +373,7 @@ pub(crate) fn build_snapshot_path(opts: &SnapshotOpts) -> String {
 ///
 /// Extracted as a pure function so it can be unit-tested without a live HTTP
 /// server.
-pub(crate) fn build_text_path(opts: &TextOpts) -> String {
+pub fn build_text_path(opts: &TextOpts) -> String {
     let mut params = Vec::new();
     if opts.raw.unwrap_or(false) {
         params.push("mode=raw".to_string());
