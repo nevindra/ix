@@ -67,6 +67,32 @@ COPY --from=pinchtab/pinchtab:latest /usr/local/bin/pinchtab /usr/local/bin/pinc
 # Node.js tools
 RUN pnpm add -g playwright-core
 
+# Stage 5: Browser-tier VM image (extends browser, no ixd)
+#
+# This stage is the rootfs for a dedicated Firecracker browser-tier VM.
+# It runs pinchtab in SERVER mode (one HTTP server managing many isolated
+# Chrome instances) and bridges AF_VSOCK:1024 → TCP 127.0.0.1:9867 so the
+# host-side Gateway can reach pinchtab over the Firecracker vsock transport.
+# ixd is NOT started; CMD is the init script which becomes PID 1.
+FROM browser AS browser-vm
+
+# socat: bridges AF_VSOCK (Firecracker host→guest) to pinchtab's TCP listener.
+# wget: used by browser-vm-init.sh to health-poll pinchtab before socat starts.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        socat wget \
+    && rm -rf /var/lib/apt/lists/*
+
+# Persistent browser-state directory (Chrome profiles / cookies).
+# In production this path is backed by a second ext4 block device attached
+# via the Firecracker /drives API (see build & verify notes in the plan doc).
+RUN mkdir -p /var/lib/ix/browser-state
+
+# Init script — becomes CMD (PID 1 in the VM).
+COPY cmd/browser-vm-init.sh /usr/local/bin/browser-vm-init
+RUN chmod +x /usr/local/bin/browser-vm-init
+
+CMD ["/usr/local/bin/browser-vm-init"]
+
 # Stage 4: Full image (extends browser)
 FROM browser AS full
 

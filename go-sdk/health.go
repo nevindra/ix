@@ -92,7 +92,7 @@ func (m *IXManager) restart(ctx context.Context, sessionID string) {
 		memMB = 128
 	}
 
-	envSlice := m.buildEnvSlice(nil)
+	envSlice := m.buildEnvSlice(nil, sessionID)
 
 	handle, err := m.vmm.startVM(ctx, sandboxID, vcpus, memMB, m.cfg.RootfsImage, envSlice)
 	if err != nil {

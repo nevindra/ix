@@ -27,21 +27,22 @@ type ResourceSpec struct {
 
 // ManagerConfig configures an IXManager.
 type ManagerConfig struct {
-	RootfsImage    string        // path to ext4 rootfs image (required)
-	KernelPath     string        // path to vmlinux kernel (required)
-	FCBinary       string        // path to firecracker binary; empty searches PATH
-	MaxConcurrent  int           // 0 = auto-detect from host resources
-	DefaultTTL     time.Duration // default: 1 hour
-	PerSandbox     ResourceSpec  // per-VM resource limits
-	MaxRestarts    int           // default: 3
-	Logger         *slog.Logger
-	DefaultEgress  *EgressPolicy // optional default egress policy applied to all sandboxes
-	PoolSize       int           // number of VMs to keep pre-warmed (default: 0 = disabled)
-	PoolMinReady   int           // minimum ready VMs before triggering replenishment (default: 1)
-	PoolWorkers    int           // parallel workers for pool fill (default: 3)
-	PreWarmKernels []string      // languages to pre-warm in pool entries (e.g., ["python"])
-	SnapshotDir    string        // directory for golden snapshot files (default: /tmp/ix-golden-snapshot)
-	UseSnapshot    bool          // enable snapshot/restore (default: false)
+	RootfsImage       string        // path to ext4 rootfs image (required)
+	KernelPath        string        // path to vmlinux kernel (required)
+	FCBinary          string        // path to firecracker binary; empty searches PATH
+	MaxConcurrent     int           // 0 = auto-detect from host resources
+	DefaultTTL        time.Duration // default: 1 hour
+	PerSandbox        ResourceSpec  // per-VM resource limits
+	MaxRestarts       int           // default: 3
+	Logger            *slog.Logger
+	DefaultEgress     *EgressPolicy // optional default egress policy applied to all sandboxes
+	PoolSize          int           // number of VMs to keep pre-warmed (default: 0 = disabled)
+	PoolMinReady      int           // minimum ready VMs before triggering replenishment (default: 1)
+	PoolWorkers       int           // parallel workers for pool fill (default: 3)
+	PreWarmKernels    []string      // languages to pre-warm in pool entries (e.g., ["python"])
+	SnapshotDir       string        // directory for golden snapshot files (default: /tmp/ix-golden-snapshot)
+	UseSnapshot       bool          // enable snapshot/restore (default: false)
+	BrowserGatewayURL string        // when set, per-chat VMs use the shared browser gateway (IX_BROWSER_MODE=remote=<url>)
 }
 
 // applyDefaults fills zero-valued fields with sensible defaults.
@@ -259,7 +260,7 @@ func (m *IXManager) Create(ctx context.Context, opts sandbox.CreateOpts) (sandbo
 	}
 
 	// Build env vars.
-	envSlice := m.buildEnvSlice(resolved.Env)
+	envSlice := m.buildEnvSlice(resolved.Env, resolved.SessionID)
 
 	// Launch Firecracker VM.
 	handle, err := m.vmm.startVM(ctx, sandboxID, vcpus, memMB, resolved.Image, envSlice)
@@ -423,7 +424,9 @@ func (m *IXManager) destroy(ctx context.Context, sessionID string) error {
 }
 
 // buildEnvSlice constructs the env var slice to pass to ix-vmm.
-func (m *IXManager) buildEnvSlice(userEnv map[string]string) []string {
+// chatID is the per-sandbox session identifier; pass "" for pool entries that
+// have no assigned chat yet (IX_CHAT_ID will be omitted in that case).
+func (m *IXManager) buildEnvSlice(userEnv map[string]string, chatID string) []string {
 	var envSlice []string
 	for k, v := range userEnv {
 		envSlice = append(envSlice, k+"="+v)
@@ -436,6 +439,14 @@ func (m *IXManager) buildEnvSlice(userEnv map[string]string) []string {
 			envSlice = append(envSlice, "IX_EGRESS_RULES="+strings.Join(m.cfg.DefaultEgress.Rules, ","))
 		}
 	}
+
+	if m.cfg.BrowserGatewayURL != "" {
+		envSlice = append(envSlice, "IX_BROWSER_MODE=remote="+m.cfg.BrowserGatewayURL)
+		if chatID != "" {
+			envSlice = append(envSlice, "IX_CHAT_ID="+chatID)
+		}
+	}
+
 	return envSlice
 }
 
@@ -624,7 +635,7 @@ func (m *IXManager) createPoolEntry(ctx context.Context) (*poolEntry, error) {
 		memMB = 128
 	}
 
-	envSlice := m.buildEnvSlice(nil)
+	envSlice := m.buildEnvSlice(nil, "") // pool entries have no assigned chat id yet
 
 	handle, err := m.vmm.startVM(ctx, sandboxID, vcpus, memMB, m.cfg.RootfsImage, envSlice)
 	if err != nil {

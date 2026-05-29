@@ -717,13 +717,23 @@ git add daemon/crates/ix-server/src/main.rs
 1. Egress matcher port + table tests (mirror the Rust `policy.rs` test cases exactly).
 2. Header parsing: `X-IX-Chat-Id` (required → 400 if missing), `X-IX-Egress-Policy` (JSON → `EgressPolicy`).
 3. Egress enforcement on navigate-like calls: deny → `403` before forwarding.
-4. Routing: `place(chat_id) → browser-VM` (Option 2: the single VM) + chat_id → pinchtab instance.
-5. Forward over `vsockTransport`; stream byte responses (screenshot/pdf) through unchanged.
+4. Chat→instance lifecycle manager: on first call for a chat, `POST /instances/start` + `/instances/{id}/tabs/open`, cache `chat_id → {instanceId, tabId}`; reuse on subsequent calls. (Unit-test against a mock pinchtab `httptest.Server`.)
+5. Translate `/v1/browser/<op>` → tab-scoped pinchtab route (`/tabs/{tabId}/<op>`); forward over `vsockTransport`; stream byte responses (screenshot/pdf) through unchanged.
 6. Heartbeat state machine; return `503` for calls bound to an `Unhealthy` VM.
 7. `DELETE /chats/{chat_id}` for eager teardown of a chat's pinchtab instance.
 
-**⚠ Must resolve first (real, discovered during code review — blocks step-level planning):**
-- **Pinchtab placement is NOT a `?profile=` query.** From the pinchtab source: Chrome instances are launched via `Orchestrator.Launch(name, port, ...)` keyed by **profile name**, and requests route by **tabID → instance port** (`internal/scheduler/scheduler.go:19-22,376-406`); `agentId` is only a fair-queue label. So the gateway cannot just append `?profile=<chat_id>` to a generic browser endpoint — it must **drive pinchtab's instance lifecycle**: launch (or look up) a profile/instance for the chat, discover its port, then forward to that instance. Decide the exact pinchtab API the gateway calls to create/resolve a per-chat instance, and the per-chat→port map it keeps. This is the single biggest unknown.
+**✅ RESOLVED (2026-05-29) — pinchtab integration design.** Investigation of the pinchtab source settled the linchpin:
+- Run the browser-tier VM's pinchtab in **`pinchtab server`** mode (`cmd/pinchtab/cmd_server.go` → `internal/server/server.go`): one HTTP server (default `:9867`) that manages N isolated Chrome instances, each with its own profile dir and its own child bridge port (range `9868–9968`).
+- **Topology constraint:** over Firecracker vsock only ONE guest port is reachable per CONNECT, so the gateway routes everything through the pinchtab **server** port (not the per-instance ports). The browser-VM's guest vsock bridge maps AF_VSOCK:1024 → TCP `127.0.0.1:9867`.
+- **Per-chat lifecycle the gateway drives (all on `:9867`):**
+  - create: `POST /instances/start` `{"mode":"headless","profileId":"chat-<id>"}` → `201 {"id","port","profileName",...}`. Using a stable `profileId` per chat reuses the on-disk profile dir → cookies survive restart.
+  - open a tab: `POST /instances/{id}/tabs/open` → `{tabId}` (confirmed in `docs/reference/tabs.md`).
+  - keep a map `chat_id → {instanceId, tabId}`.
+  - per-op routing (tab-scoped, server-resolved): `POST /tabs/{tabId}/navigate`, `GET /tabs/{tabId}/snapshot`, `GET /tabs/{tabId}/text`, `POST /tabs/{tabId}/action`, `POST /tabs/{tabId}/find`, and `/tabs/{tabId}/screenshot|pdf|evaluate` (verify exact names against `docs/reference/tabs.md` while implementing).
+  - destroy: `POST /instances/{instanceId}/stop` (profile dir persists on disk).
+- Auth: send `Authorization: Bearer <PINCHTAB_TOKEN>` when the server is configured with a token.
+
+**⚠ Still open (smaller):**
 - **Per-chat Chrome reaper.** Pinchtab has no built-in per-profile idle reaper (only session idle/lifetime + per-tab eviction). The gateway must implement the LRU instance cap (`memory_mb/250` heuristic) and stop idle chats' instances via the orchestrator. Decide where this lives.
 - **Auth (spec open Q3).** Day-1 default: rely on passt reachability, support an optional `IX_BROWSER_GATEWAY_TOKEN` (already plumbed in Phase 1 Task 1.6). Confirm whether to require it.
 - **Gateway packaging:** separate Go binary vs a component started inside the existing `go-sdk` host process. Affects file layout and how it gets the browser-VM's vsock path.
@@ -755,6 +765,115 @@ git add daemon/crates/ix-server/src/main.rs
 - **State directory is NOT a host bind-mount.** Firecracker cannot bind-mount a host directory; `/var/lib/ix/browser-state` must be either a **second ext4 block device** attached via the Firecracker `/drives` API (mirror the rootfs drive setup in `vmm.go:174-184`) or **virtiofs**. The spec's "host-mounted directory" is not directly achievable — pick the drive-image approach for day-1 and decide how it's created/sized per browser-VM.
 - **Browser-VM init.** Define PID 1 for the browser-vm rootfs (e.g. a small init script that starts the vsock bridge + pinchtab in server mode, reading `IX_BROWSER_STATE_DIR`). This depends on the bridge decision above.
 - **Sizing + snapshot (spec open Q4/Q5).** Decide the browser-VM memory arg and whether it gets a golden snapshot for fast cold start.
+
+---
+
+## Browser-tier VM — build & verify
+
+### Build the stage
+
+```bash
+docker build --target browser-vm -f daemon/cmd/Dockerfile daemon/
+```
+
+This produces a Docker image containing Chrome, Node.js, pinchtab, socat, and
+`/usr/local/bin/browser-vm-init`. The image is NOT run directly in production —
+it is the source for an ext4 rootfs image via the project's rootfs build step
+(e.g. converting the image filesystem to an ext4 block device for Firecracker).
+
+### Rootfs production
+
+Extract the image filesystem and write it into an ext4 image using the
+project's existing rootfs build step. The exact tooling name is not yet
+codified; the generic approach is:
+
+```bash
+# Example — adapt to whatever rootfs tooling the project uses:
+CID=$(docker create <image-id>)
+docker export "$CID" | ... # pipe into mke2fs / genext2fs / etc.
+docker rm "$CID"
+```
+
+### Firecracker boot notes
+
+- **Kernel init:** pass `init=/usr/local/bin/browser-vm-init` on the kernel
+  command line (Firecracker `boot_args`). The script mounts `/proc`, `/sys`,
+  `/dev`, writes the pinchtab config, starts pinchtab in the background, waits
+  for it to become healthy, then `exec socat` as the long-lived PID-1 process.
+- **Memory:** pinchtab SERVER mode runs multiple headless Chrome instances.
+  Use at least **4096 MiB** (`mem_size_mib: 4096`); increase if the pool runs
+  more than ~4 concurrent instances.
+- **vCPUs:** 2–4 recommended (Chrome is multi-threaded).
+- **Browser-state drive:** Chrome profile dirs and cookies must survive a VM
+  restart. Attach a second ext4 block device via the Firecracker `/drives` API
+  (mirror the rootfs drive setup in `go-sdk/vmm.go:174-184`). Mount it at
+  `/var/lib/ix/browser-state` inside the VM, or set `IX_BROWSER_STATE_DIR` on
+  the kernel boot args to point at a different mountpoint. The init script
+  creates the directory if it does not exist, but data will not survive restart
+  unless the directory is on a persistent drive.
+- **vsock:** the vsock device must be configured in the Firecracker VM config
+  (the existing `go-sdk` VMM already does this for regular VMs via `passt` +
+  vsock). No READY handshake is emitted by the browser-VM (pinchtab does not
+  send one); poll `/health` via the vsock transport instead, the same way
+  `SnapshotManager.Restore` does in `go-sdk/snapshot.go`.
+- **Environment variables passed via boot args:**
+  - `PINCHTAB_TOKEN=<token>` — shared secret between the Gateway and pinchtab;
+    passed as a kernel boot arg (env var) by `buildKernelBootArgs` in `vmm.go`.
+  - `IX_BROWSER_STATE_DIR` — override the state dir if the drive is mounted
+    at a non-default path.
+
+### Smoke check (from the Firecracker host)
+
+Connect to the browser-VM's vsock UDS using the existing vsock transport
+(the same `CONNECT 1024 / OK <port>` handshake that `go-sdk/vmm_vsock.go`
+implements), then send raw HTTP:
+
+```
+# Establish vsock tunnel to guest port 1024 (socat bridges it to pinchtab)
+# Using socat on the host as a stand-in for the Go vsock transport:
+socat - UNIX-CONNECT:<vm-vsock-uds>
+
+# Once connected, send the CONNECT handshake then HTTP:
+CONNECT 1024
+# expect: OK 1024
+
+GET /health HTTP/1.0
+Host: localhost
+
+```
+
+Expected response: `200 OK` with JSON `{"status":"ok","mode":"dashboard",...}`.
+
+To verify pinchtab can start a Chrome instance:
+
+```
+POST /instances/start HTTP/1.0
+Host: localhost
+Content-Type: application/json
+Content-Length: 24
+
+{"mode":"headless"}
+```
+
+Expected: `201 Created` with JSON containing `{"id":"...","port":...}`.
+
+### Configuration summary (config keys used, all verified against pinchtab source)
+
+| JSON key | Source file:struct | Value written by init |
+|---|---|---|
+| `server.port` | `config_types.go:ServerConfig` | `"9867"` |
+| `server.bind` | `config_types.go:ServerConfig` | `"127.0.0.1"` |
+| `server.token` | `config_types.go:ServerConfig` | `$PINCHTAB_TOKEN` (empty = auto-generated) |
+| `profiles.baseDir` | `config_types.go:ProfilesConfig` | `$IX_BROWSER_STATE_DIR` (default `/var/lib/ix/browser-state`) |
+| `instanceDefaults.mode` | `config_types.go:InstanceDefaultsConfig` | `"headless"` |
+| `security.allowEvaluate` | `config_types.go:SecurityConfig` | `true` |
+| `multiInstance.instancePortStart` | `config_types.go:MultiInstanceConfig` | `9868` |
+| `multiInstance.instancePortEnd` | `config_types.go:MultiInstanceConfig` | `9968` |
+
+Config file path is passed via `PINCHTAB_CONFIG` env var
+(`config_load.go:131`). Token env var `PINCHTAB_TOKEN` takes precedence over
+`server.token` in the file (`config_load.go:59`, `applyFileConfig` skips token
+when `PINCHTAB_TOKEN` is set).
 
 ---
 
