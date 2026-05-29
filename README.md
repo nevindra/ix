@@ -18,19 +18,25 @@ ix has **two halves** that talk over a tiny, fast channel called **vsock**:
 
 The golden rule: **every sandbox operation is just an HTTP request from the host to the daemon.** The SDK is a thin, typed client; the daemon is the engine.
 
-```
-HOST (your machine)                         GUEST (one MicroVM per sandbox)
-┌──────────────────────────┐               ┌──────────────────────────────┐
-│ Your Go app              │               │  ixd daemon (Rust, PID 1)     │
-│   │ ix.NewManager()      │    vsock      │  HTTP + SSE on vsock:1024     │
-│   ▼                      │   "CONNECT    │   ┌────────────────────────┐  │
-│ IXManager                │     1024"     │   │ /shell  /code  /files  │  │
-│  • VM pool & lifecycle   │ ────────────▶ │   │ /fetch  /browser/*     │  │
-│  • health (10s) + reaper │               │   │ /egress                │  │
-│  • Firecracker + passt   │               │   └────────────────────────┘  │
-│   │ Create() → IXSandbox │               │  bash / Python / Chrome run   │
-│   ▼ sb.Shell(), sb.Exec… │               │  here, inside the VM          │
-└──────────────────────────┘               └──────────────────────────────┘
+A **chat** is one Oasis session = **one MicroVM** with its own private workspace. The `Browser Gateway` and `Browser-tier MicroVM` below exist **only** if you opt into the shared-browser mode; in the default mode there's just your app, the per-chat VMs, and the daemon inside each.
+
+```mermaid
+flowchart LR
+    subgraph HOST["HOST - your machine"]
+        APP["Your Go app<br/>Oasis agent = a chat"]
+        MGR["IXManager<br/>pool - lifecycle - health - reaper"]
+        GW["Browser Gateway<br/>shared-browser mode only"]
+        APP --> MGR
+    end
+    subgraph GUEST["GUEST - one MicroVM per chat"]
+        IXD["ixd daemon PID 1<br/>shell - code - files - fetch - browser"]
+    end
+    subgraph BVM["Browser-tier MicroVM - shared mode only"]
+        PT["pinchtab server<br/>one isolated Chrome per chat"]
+    end
+    MGR -- "vsock - HTTP + SSE" --> IXD
+    IXD -. "browser calls over passt" .-> GW
+    GW -- vsock --> PT
 ```
 
 ### Why MicroVMs?
@@ -47,6 +53,24 @@ Take `sb.Shell(ctx, {Command: "echo hi"})`:
 4. The SDK surfaces the result (or live stream) to your code.
 
 Streaming operations (shell, code) use SSE; one-shot operations (file read, stat) are plain JSON.
+
+**A chat that doesn't need a browser** stays entirely inside its own VM — shell, code, and file ops never leave it:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant App as Your app (a chat)
+    participant Mgr as IXManager (host)
+    participant SB as IXSandbox (host)
+    participant IXD as ixd daemon (chat's MicroVM)
+    App->>Mgr: Create(SessionID)
+    Mgr-->>App: IXSandbox (leases a pre-warmed VM)
+    App->>SB: sb.Shell("echo hi")
+    SB->>IXD: POST /shell over vsock (CONNECT 1024)
+    IXD-->>SB: SSE stream (stdout / stderr)
+    SB-->>App: ShellResult
+    Note over App,IXD: code exec and file ops work the same way, all inside this chat's own VM
+```
 
 ### Inside the daemon
 
@@ -75,24 +99,69 @@ The daemon is configured by **environment variables only** (`IX_ADDR`, `IX_WORKS
 - **passt** gives the guest user-mode **outbound** networking (so sandboxed code can reach the internet) without handing it raw access to the host's network.
 - **Egress firewall** (`ix-egress`) enforces a DNS-level allow/deny list *inside* the VM, so a sandbox can only resolve the domains you permit (see [Egress policy](#egress-policy)).
 
-### Browser: two modes
+### When a chat needs a browser
 
-Browsing is the heaviest capability — a headless Chrome is roughly 700 MB of RAM. ix can provide it two ways, both behind the **same** `BrowserBackend` interface, so your daemon code and API are identical either way:
+Browsing is the heaviest capability — a headless Chrome is ~700 MB of RAM — so ix offers two modes, both behind the **same** `BrowserBackend` interface (your code and API are identical either way). Which one runs is decided purely by whether you set `BrowserGatewayURL`:
 
-**1. In-VM (default).** Each sandbox VM runs its own Pinchtab + headless Chrome. Simplest and most isolated, but it doesn't scale cheaply — 30 chats means 30 Chrome processes (~21 GB). This is the out-of-the-box path (`IX_BROWSER_MODE=local`).
-
-**2. Shared browser tier (opt-in).** Set `ManagerConfig.BrowserGatewayURL` and each per-chat daemon swaps its in-VM Chrome for a `RemoteSharedBrowserBackend` that forwards browser calls to a host-side **Browser Gateway**. The gateway gives every chat its own isolated Chrome **instance** (own profile dir, own cookies) inside a *single shared* **browser-tier VM** running Pinchtab in `server` mode — so many chats share one small pool of Chrome processes instead of one each. The gateway also enforces each chat's egress policy and health-checks the browser VM.
-
-```
-Per-chat VM ── HTTP (passt) ──▶ Browser Gateway ── vsock ──▶ Browser-tier VM
-ixd:                            (host, Go)                   pinchtab `server`:
-RemoteSharedBrowserBackend      • chat → Chrome instance     • 1 isolated Chrome
-  • carries chat_id +           • per-chat egress check        per chat (profile dir)
-    egress policy in headers    • heartbeat / 503 on down    • cookies persist on a
-                                                               host-side state disk
+```mermaid
+flowchart TD
+    OP["An operation from a chat"] --> Q1{"Is it a browser op?"}
+    Q1 -- "no: shell / code / files / fetch" --> OWN["Handled by ixd<br/>inside the chat's own VM"]
+    Q1 -- yes --> Q2{"BrowserGatewayURL set?"}
+    Q2 -- "no (default)" --> INVM["Mode 1: in-VM Chrome<br/>PinchtabBackend, same VM"]
+    Q2 -- "yes (opt-in)" --> REMOTE["Mode 2: shared tier<br/>forward to Browser Gateway"]
 ```
 
-When `BrowserGatewayURL` is set, the SDK injects `IX_BROWSER_MODE=remote=<url>` and `IX_CHAT_ID=<session id>` into each per-chat VM automatically. The shared tier is **opt-in** and intended for Firecracker-host deployments; the default in-VM mode needs no extra setup. Design and rollout details live in `docs/superpowers/specs/` and `docs/superpowers/plans/`.
+**Mode 1 — in-VM (default).** Each chat's VM runs its own Pinchtab + headless Chrome. Simplest and most isolated, but it doesn't scale cheaply: 30 chats = 30 Chrome processes (~21 GB). No setup needed (`IX_BROWSER_MODE=local`).
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant App as Your app (a chat)
+    participant SB as IXSandbox (host)
+    participant IXD as ixd daemon (chat's VM)
+    participant CR as headless Chrome (same VM)
+    App->>SB: sb.BrowserNavigate(url)
+    SB->>IXD: POST /v1/browser/navigate (vsock)
+    Note over IXD: IX_BROWSER_MODE=local -> PinchtabBackend
+    IXD->>CR: drive Chrome (Pinchtab / CDP)
+    CR-->>IXD: page result
+    IXD-->>SB: NavigateResult
+    SB-->>App: result
+```
+
+**Mode 2 — shared browser tier (opt-in).** Set `ManagerConfig.BrowserGatewayURL`. Each chat's daemon swaps its in-VM Chrome for a `RemoteSharedBrowserBackend` that forwards browser calls — carrying `chat_id` and the egress policy in headers — to a host-side **Browser Gateway**. The gateway gives every chat its own isolated Chrome **instance** (own profile dir + cookies) inside a *single shared* **browser-tier VM** running Pinchtab in `server` mode, so many chats share one small pool of Chrome processes instead of one each. It also enforces each chat's egress policy (deny → 403) and health-checks the browser VM (down → 503).
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant App as Your app (a chat)
+    participant SB as IXSandbox (host)
+    participant IXD as ixd daemon (chat's VM)
+    participant GW as Browser Gateway (host)
+    participant PT as pinchtab server (browser-tier VM)
+    participant CR as Chrome (this chat's profile)
+    App->>SB: sb.BrowserNavigate(url)
+    SB->>IXD: POST /v1/browser/navigate (vsock)
+    Note over IXD: IX_BROWSER_MODE=remote -> RemoteSharedBrowserBackend
+    IXD->>GW: POST /v1/browser/navigate over passt (X-IX-Chat-Id, X-IX-Egress-Policy)
+    GW->>GW: egress check on target host (deny -> 403)
+    opt first browser call for this chat
+        GW->>PT: POST /instances/start {profileId: chat-id}
+        PT-->>GW: instance id + port
+        GW->>PT: POST /instances/{id}/tabs/open
+        PT-->>GW: tabId
+    end
+    GW->>PT: POST /tabs/{tabId}/navigate (vsock)
+    PT->>CR: drive this chat's Chrome
+    CR-->>PT: page result
+    PT-->>GW: result
+    GW-->>IXD: result
+    IXD-->>SB: NavigateResult
+    SB-->>App: result
+```
+
+When `BrowserGatewayURL` is set, the SDK injects `IX_BROWSER_MODE=remote=<url>` and `IX_CHAT_ID=<session id>` into each chat's VM automatically. The shared tier is **opt-in** and meant for Firecracker-host deployments; the default in-VM mode needs no extra setup. Design and rollout details: `docs/superpowers/specs/` and `docs/superpowers/plans/`.
 
 ## Prerequisites
 
