@@ -6,6 +6,8 @@ pub enum BrowserMode {
     Local,
     /// Proxy browser calls to a shared Browser Gateway at this URL.
     Remote { gateway_url: String },
+    /// No browser capability at all (light sandbox).
+    Disabled,
 }
 
 #[derive(Debug, Clone)]
@@ -52,6 +54,7 @@ impl DaemonConfig {
             Ok(v) if v.starts_with("remote=") => BrowserMode::Remote {
                 gateway_url: v["remote=".len()..].to_string(),
             },
+            Ok(v) if v == "disabled" => BrowserMode::Disabled,
             _ => BrowserMode::Local,
         };
 
@@ -233,6 +236,12 @@ mod tests {
                 gateway_url: "http://169.254.0.1:9100".to_string()
             }
         );
+    }
+
+    #[test]
+    fn browser_mode_disabled_parsed() {
+        let cfg = with_env(&[("IX_BROWSER_MODE", "disabled")], DaemonConfig::from_env);
+        assert_eq!(cfg.browser_mode, BrowserMode::Disabled);
     }
 
     #[test]

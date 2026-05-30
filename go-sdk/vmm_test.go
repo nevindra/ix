@@ -180,3 +180,27 @@ func TestBuildKernelBootArgsSpecialChars(t *testing.T) {
 		t.Errorf("boot args missing ix.env.EMPTY=: %s", args)
 	}
 }
+
+func TestBuildDriveSpec(t *testing.T) {
+	spec := buildDriveSpec("state", "/var/lib/ix/state.ext4", false)
+	if spec["drive_id"] != "state" {
+		t.Errorf("drive_id = %v, want state", spec["drive_id"])
+	}
+	if spec["path_on_host"] != "/var/lib/ix/state.ext4" {
+		t.Errorf("path_on_host = %v", spec["path_on_host"])
+	}
+	if spec["is_root_device"] != false {
+		t.Errorf("is_root_device = %v, want false", spec["is_root_device"])
+	}
+	if spec["is_read_only"] != false {
+		t.Errorf("is_read_only = %v, want false", spec["is_read_only"])
+	}
+
+	ro := buildDriveSpec("ro-disk", "/var/lib/ix/ro.ext4", true)
+	if ro["is_read_only"] != true {
+		t.Errorf("is_read_only = %v, want true", ro["is_read_only"])
+	}
+	if ro["is_root_device"] != false {
+		t.Errorf("is_root_device = %v, want false", ro["is_root_device"])
+	}
+}

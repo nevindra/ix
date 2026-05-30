@@ -22,7 +22,7 @@ import (
 // ResourceSpec defines per-sandbox resource limits for the VM.
 type ResourceSpec struct {
 	VCPUs  int   // number of virtual CPUs; 0 uses default (1)
-	Memory int64 // bytes; 0 uses default (512 MB)
+	Memory int64 // bytes; 0 uses default (256 MB)
 }
 
 // ManagerConfig configures an IXManager.
@@ -43,6 +43,14 @@ type ManagerConfig struct {
 	SnapshotDir       string        // directory for golden snapshot files (default: /tmp/ix-golden-snapshot)
 	UseSnapshot       bool          // enable snapshot/restore (default: false)
 	BrowserGatewayURL string        // when set, per-chat VMs use the shared browser gateway (IX_BROWSER_MODE=remote=<url>)
+
+	// Browser-tier (shared browser VM) settings. Active when BrowserMode=="remote".
+	BrowserMode       string // "" / "local" (no tier) or "remote" (boot a shared browser-tier VM)
+	BrowserVMImage    string // rootfs path for the browser-tier VM (browser-vm tier)
+	BrowserVMMemoryMB int64  // browser-tier VM memory; default 4096
+	BrowserStateImage string // optional ext4 state disk attached to the browser-tier VM; empty = ephemeral
+	GatewayListenAddr string // host addr the gateway binds, reachable from guests via passt; default "169.254.0.1:9100"
+	GatewayToken      string // optional bearer token forwarded to pinchtab and required from daemons
 }
 
 // applyDefaults fills zero-valued fields with sensible defaults.
@@ -54,7 +62,7 @@ func (c *ManagerConfig) applyDefaults() {
 		c.PerSandbox.VCPUs = 1
 	}
 	if c.PerSandbox.Memory == 0 {
-		c.PerSandbox.Memory = 512 << 20 // 512 MB
+		c.PerSandbox.Memory = 256 << 20 // 256 MB (base image; was 512 for the heavy image)
 	}
 	if c.MaxRestarts == 0 {
 		c.MaxRestarts = 3
@@ -76,6 +84,24 @@ func (c *ManagerConfig) applyDefaults() {
 	if c.UseSnapshot && c.SnapshotDir == "" {
 		c.SnapshotDir = filepath.Join(os.TempDir(), "ix-golden-snapshot")
 	}
+	if c.BrowserMode == "remote" {
+		if c.BrowserVMMemoryMB == 0 {
+			c.BrowserVMMemoryMB = 4096
+		}
+		if c.GatewayListenAddr == "" {
+			c.GatewayListenAddr = defaultGatewayListenAddr
+		}
+	}
+}
+
+// MaxInflightOrDefault returns the per-VM browser in-flight cap (heuristic from
+// the browser-tier memory: ~1 Chrome per 250 MB), min 1.
+func (c ManagerConfig) MaxInflightOrDefault() int {
+	n := int(c.BrowserVMMemoryMB / 250)
+	if n < 1 {
+		n = 1
+	}
+	return n
 }
 
 // poolEntry represents a pre-warmed VM ready to be claimed.
@@ -100,6 +126,8 @@ type IXManager struct {
 	pool     []*poolEntry  // pre-warmed VMs ready to be claimed
 	poolMu   sync.Mutex    // guards pool slice
 	poolStop chan struct{} // signals pool replenisher to stop
+
+	tier *browserTier // shared browser-tier VM + gateway (nil when BrowserMode != "remote")
 }
 
 // NewManager validates config, sets up concurrency, and starts background
@@ -149,6 +177,21 @@ func NewManager(ctx context.Context, cfg ManagerConfig) (*IXManager, error) {
 		poolStop:  make(chan struct{}),
 	}
 	m.accepting.Store(true)
+
+	if cfg.BrowserMode == "remote" {
+		tier, gwURL, err := startBrowserTier(mCtx, m.vmm, cfg)
+		if err != nil {
+			// cancel() is safe here: monitor/reaper/pool goroutines start below,
+			// so none are running yet on this error path.
+			cancel()
+			return nil, fmt.Errorf("start browser tier: %w", err)
+		}
+		m.tier = tier
+		// Inject the gateway URL into m.cfg so buildEnvSlice points per-chat VMs
+		// at the tier (the URL isn't known until the tier binds, so it can't be
+		// set in applyDefaults).
+		m.cfg.BrowserGatewayURL = gwURL
+	}
 
 	if cfg.UseSnapshot {
 		vcpus := cfg.PerSandbox.VCPUs
@@ -260,10 +303,10 @@ func (m *IXManager) Create(ctx context.Context, opts sandbox.CreateOpts) (sandbo
 	}
 
 	// Build env vars.
-	envSlice := m.buildEnvSlice(resolved.Env, resolved.SessionID)
+	envSlice := m.buildEnvSlice(resolved.Env, resolved.SessionID, resolved.Browser)
 
 	// Launch Firecracker VM.
-	handle, err := m.vmm.startVM(ctx, sandboxID, vcpus, memMB, resolved.Image, envSlice)
+	handle, err := m.vmm.startVM(ctx, sandboxID, vcpus, memMB, resolved.Image, envSlice, nil)
 	if err != nil {
 		m.releaseSlot()
 		return nil, fmt.Errorf("start VM: %w", err)
@@ -374,6 +417,8 @@ func (m *IXManager) Close() error {
 		m.releaseSlot()
 	}
 
+	m.tier.stop(m.vmm)
+
 	return firstErr
 }
 
@@ -426,7 +471,11 @@ func (m *IXManager) destroy(ctx context.Context, sessionID string) error {
 // buildEnvSlice constructs the env var slice to pass to ix-vmm.
 // chatID is the per-sandbox session identifier; pass "" for pool entries that
 // have no assigned chat yet (IX_CHAT_ID will be omitted in that case).
-func (m *IXManager) buildEnvSlice(userEnv map[string]string, chatID string) []string {
+// browser controls browser-mode injection:
+//   - nil  = manager default (browser via shared tier when BrowserGatewayURL is set)
+//   - true = explicitly request browser via shared tier
+//   - false = light sandbox; browser is disabled (IX_BROWSER_MODE=disabled)
+func (m *IXManager) buildEnvSlice(userEnv map[string]string, chatID string, browser *bool) []string {
 	var envSlice []string
 	for k, v := range userEnv {
 		envSlice = append(envSlice, k+"="+v)
@@ -440,10 +489,19 @@ func (m *IXManager) buildEnvSlice(userEnv map[string]string, chatID string) []st
 		}
 	}
 
-	if m.cfg.BrowserGatewayURL != "" {
+	switch {
+	case browser != nil && !*browser:
+		// Light sandbox: explicitly disable browser so the base-image daemon
+		// does not attempt in-VM pinchtab.
+		envSlice = append(envSlice, "IX_BROWSER_MODE=disabled")
+	case m.cfg.BrowserGatewayURL != "":
+		// Browser via shared tier (nil = manager default, or explicit true).
 		envSlice = append(envSlice, "IX_BROWSER_MODE=remote="+m.cfg.BrowserGatewayURL)
 		if chatID != "" {
 			envSlice = append(envSlice, "IX_CHAT_ID="+chatID)
+		}
+		if m.cfg.GatewayToken != "" {
+			envSlice = append(envSlice, "IX_BROWSER_GATEWAY_TOKEN="+m.cfg.GatewayToken)
 		}
 	}
 
@@ -635,9 +693,9 @@ func (m *IXManager) createPoolEntry(ctx context.Context) (*poolEntry, error) {
 		memMB = 128
 	}
 
-	envSlice := m.buildEnvSlice(nil, "") // pool entries have no assigned chat id yet
+	envSlice := m.buildEnvSlice(nil, "", nil) // pool entries have no assigned chat id yet
 
-	handle, err := m.vmm.startVM(ctx, sandboxID, vcpus, memMB, m.cfg.RootfsImage, envSlice)
+	handle, err := m.vmm.startVM(ctx, sandboxID, vcpus, memMB, m.cfg.RootfsImage, envSlice, nil)
 	if err != nil {
 		m.releaseSlot()
 		return nil, fmt.Errorf("pool start VM: %w", err)

@@ -7,7 +7,7 @@ IX_ROOTFS_SIZE="${IX_ROOTFS_SIZE:-2048}"
 IX_ROOTFS_IMAGE="${IX_ROOTFS_IMAGE:-/opt/ix/rootfs/${TIER}.ext4}"
 TEMP_ROOTFS=""
 
-readonly VALID_TIERS=("base" "browser" "full")
+readonly VALID_TIERS=("base" "browser" "full" "browser-vm")
 readonly IMAGE_TAG="ix:${TIER}"
 readonly DAEMON_BIN="../daemon/target/x86_64-unknown-linux-musl/release/ixd"
 
@@ -98,6 +98,23 @@ INIT_SCRIPT_DONE=1
   sudo cp "${SCRIPT_DIR}/../../daemon/crates/ix-code/src/ix_repl.py" "${temp_dir}/usr/lib/ix/repl.py"
   sudo chmod 644 "${temp_dir}/usr/lib/ix/repl.py"
   echo "✓ ix REPL script installed"
+}
+
+install_browser_vm_init() {
+  local temp_dir="$1"
+  # The browser-vm Docker stage already COPYs browser-vm-init to
+  # /usr/local/bin/browser-vm-init and chmod +x it. Verify it is present so a
+  # mis-tagged image fails loudly instead of producing an unbootable rootfs.
+  if [[ ! -x "${temp_dir}/usr/local/bin/browser-vm-init" ]]; then
+    echo "Error: browser-vm rootfs missing /usr/local/bin/browser-vm-init — did you build the browser-vm Docker stage?" >&2
+    return 1
+  fi
+  # Symlink /sbin/ix-init -> browser-vm-init so a fixed kernel init= path works
+  # for both tiers (kernel boot args use init=/sbin/ix-init). Use a relative
+  # target so the link resolves correctly whether the rootfs is the live VM
+  # root or inspected while mounted under a prefix.
+  sudo ln -sf ../usr/local/bin/browser-vm-init "${temp_dir}/sbin/ix-init"
+  echo "✓ browser-vm init linked at /sbin/ix-init"
 }
 
 create_directories() {
@@ -215,8 +232,13 @@ main() {
 
   # Populate rootfs
   create_directories "$TEMP_ROOTFS"
-  copy_daemon_binary "$TEMP_ROOTFS"
-  create_init_script "$TEMP_ROOTFS"
+  if [[ "$TIER" == "browser-vm" ]]; then
+    echo "browser-vm tier: skipping ixd + ix-init (PID 1 is browser-vm-init from the image)"
+    install_browser_vm_init "$TEMP_ROOTFS"
+  else
+    copy_daemon_binary "$TEMP_ROOTFS"
+    create_init_script "$TEMP_ROOTFS"
+  fi
 
   # Create ext4 image
   create_ext4_image "$TEMP_ROOTFS" "$IX_ROOTFS_IMAGE" "$IX_ROOTFS_SIZE"

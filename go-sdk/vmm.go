@@ -45,6 +45,20 @@ func (c *FirecrackerConfig) Validate() error {
 	return nil
 }
 
+// driveSpec is a Firecracker /drives/{id} PUT body.
+type driveSpec map[string]any
+
+// buildDriveSpec builds a non-root Firecracker drive body. readOnly toggles
+// is_read_only; is_root_device is always false (rootfs uses its own setup).
+func buildDriveSpec(id, pathOnHost string, readOnly bool) driveSpec {
+	return driveSpec{
+		"drive_id":       id,
+		"path_on_host":   pathOnHost,
+		"is_root_device": false,
+		"is_read_only":   readOnly,
+	}
+}
+
 // cidCounter allocates unique CIDs for each VM.
 // CIDs 0-2 are reserved (VMADDR_CID_ANY, VMADDR_CID_HYPERVISOR, VMADDR_CID_HOST).
 var cidCounter atomic.Uint32
@@ -95,11 +109,15 @@ type firecrackerBackend struct {
 // startVM is the primary VM-creation entry point.  When a SnapshotManager is
 // attached and has a ready golden snapshot, it delegates to snapshot.Restore for
 // ~10x faster VM startup.  Otherwise it falls back to a full cold boot.
-func (fb *firecrackerBackend) startVM(ctx context.Context, sandboxID string, vcpus int, memMB int64, rootfsImage string, envSlice []string) (*VMMHandle, error) {
+func (fb *firecrackerBackend) startVM(ctx context.Context, sandboxID string, vcpus int, memMB int64, rootfsImage string, envSlice []string, extraDrives []driveSpec) (*VMMHandle, error) {
 	if fb.snapshot != nil && fb.snapshot.Ready() && rootfsImage == fb.rootfsImage {
+		// extraDrives are intentionally not forwarded here: a snapshot-restored
+		// VM uses the drive set baked into the golden snapshot, so extra drives
+		// cannot be injected. Callers needing extra drives (e.g. the browser
+		// tier's state disk) cold-boot via startVMCold directly.
 		return fb.snapshot.Restore(ctx, sandboxID)
 	}
-	return fb.startVMCold(ctx, sandboxID, vcpus, memMB, rootfsImage, envSlice)
+	return fb.startVMCold(ctx, sandboxID, vcpus, memMB, rootfsImage, envSlice, extraDrives)
 }
 
 // startVMCold launches a Firecracker VM and returns a VMMHandle on success.
@@ -114,7 +132,7 @@ func (fb *firecrackerBackend) startVM(ctx context.Context, sandboxID string, vcp
 //
 // On any error after process creation, the process and passt are killed and
 // the socket dir is removed before returning.
-func (fb *firecrackerBackend) startVMCold(ctx context.Context, sandboxID string, vcpus int, memMB int64, rootfsImage string, envSlice []string) (*VMMHandle, error) {
+func (fb *firecrackerBackend) startVMCold(ctx context.Context, sandboxID string, vcpus int, memMB int64, rootfsImage string, envSlice []string, extraDrives []driveSpec) (*VMMHandle, error) {
 	cid := allocateCID()
 
 	socketDir := filepath.Join(os.TempDir(), "ix-"+sandboxID)
@@ -181,6 +199,17 @@ func (fb *firecrackerBackend) startVMCold(ctx context.Context, sandboxID string,
 		killPID(passtPID)
 		_ = os.RemoveAll(socketDir)
 		return nil, fmt.Errorf("set rootfs drive: %w", err)
+	}
+
+	// Configure: extra (non-root) drives, e.g. the browser-tier state disk.
+	for _, d := range extraDrives {
+		id, _ := d["drive_id"].(string)
+		if err := fcPut(ctx, apiClient, "/drives/"+id, d); err != nil {
+			_ = cmd.Process.Kill()
+			killPID(passtPID)
+			_ = os.RemoveAll(socketDir)
+			return nil, fmt.Errorf("set drive %s: %w", id, err)
+		}
 	}
 
 	// Configure: machine resources.

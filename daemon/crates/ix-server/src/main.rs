@@ -91,6 +91,11 @@ async fn main() {
             pinchtab = Some(backend);
             trait_obj
         }
+        ix_core::config::BrowserMode::Disabled => {
+            info!("browser disabled for this sandbox (light mode)");
+            pinchtab = None;
+            Arc::new(ix_browser::NoopBrowserBackend::new())
+        }
     };
 
     let kernels = Arc::new(ix_code::KernelManager::new());

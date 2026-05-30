@@ -18,8 +18,8 @@ func TestDefaultManagerConfig(t *testing.T) {
 	if cfg.PerSandbox.VCPUs != 1 {
 		t.Errorf("PerSandbox.VCPUs = %d, want 1", cfg.PerSandbox.VCPUs)
 	}
-	if cfg.PerSandbox.Memory != 512<<20 {
-		t.Errorf("PerSandbox.Memory = %d, want %d", cfg.PerSandbox.Memory, 512<<20)
+	if cfg.PerSandbox.Memory != 256<<20 {
+		t.Errorf("PerSandbox.Memory = %d, want %d", cfg.PerSandbox.Memory, 256<<20)
 	}
 	if cfg.MaxRestarts != 3 {
 		t.Errorf("MaxRestarts = %d, want 3", cfg.MaxRestarts)
@@ -209,5 +209,21 @@ func TestAutoDetectMaxZeroResources(t *testing.T) {
 	})
 	if result < 1 {
 		t.Errorf("autoDetectMax() with zero resources = %d, want >= 1", result)
+	}
+}
+
+func TestApplyDefaults_PerChatMemory256(t *testing.T) {
+	cfg := ManagerConfig{}
+	cfg.applyDefaults()
+	if want := int64(256 << 20); cfg.PerSandbox.Memory != want {
+		t.Errorf("default per-sandbox memory = %d, want %d (256 MB)", cfg.PerSandbox.Memory, want)
+	}
+}
+
+func TestApplyDefaults_BrowserTierMemoryDefault(t *testing.T) {
+	cfg := ManagerConfig{BrowserMode: "remote"}
+	cfg.applyDefaults()
+	if cfg.BrowserVMMemoryMB != 4096 {
+		t.Errorf("default browser-tier memory = %d MB, want 4096", cfg.BrowserVMMemoryMB)
 	}
 }
