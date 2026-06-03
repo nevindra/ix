@@ -28,7 +28,11 @@ func TestBrowserTierEndToEnd(t *testing.T) {
 		BrowserMode:       "remote",
 		BrowserVMImage:    browserImg,
 		BrowserVMMemoryMB: 4096,
-		GatewayListenAddr: "127.0.0.1:9100",
+		// The gateway must bind the link-local IP the manager pins on ixgw0, not
+		// loopback: a per-chat VM's 127.0.0.1 is its OWN loopback, so it could
+		// never reach a host-loopback gateway. 169.254.0.1 is routable from the
+		// guest via its per-VM TAP default route. (Also the applyDefaults value.)
+		GatewayListenAddr: "169.254.0.1:9100",
 	})
 	if err != nil {
 		t.Fatalf("NewManager (with browser tier): %v", err)

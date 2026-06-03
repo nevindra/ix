@@ -79,6 +79,7 @@ TOKEN_VALUE="${PINCHTAB_TOKEN:-ix-internal}"
 
 cat > "$CONFIG_PATH" <<EOF
 {
+  "configVersion": "0.8.0",
   "server": {
     "port": "9867",
     "bind": "127.0.0.1",
@@ -104,13 +105,17 @@ EOF
 export PINCHTAB_CONFIG="$CONFIG_PATH"
 
 # ---------------------------------------------------------------------------
-# 3. Start the pinchtab bridge in the background
+# 3. Start the pinchtab orchestrator (server) in the background
 #    Must be started BEFORE socat so that by the time the first vsock
 #    connection arrives, pinchtab is already listening on 127.0.0.1:9867.
-#    Use `bridge`, NOT `server`: `server` runs an interactive security-posture
-#    wizard that blocks on stdin forever in a headless VM.
+#    Use `server` (the multi-instance orchestrator serving /instances/*), which
+#    the host Gateway requires — NOT `bridge` (single-instance, no /instances
+#    API → gateway gets 404 on /instances/start). `server` normally runs an
+#    interactive first-run security wizard, but it is skipped here because the
+#    config above carries a current "configVersion" (pinchtab's NeedsWizard
+#    returns false), so it starts non-interactively in a headless VM.
 # ---------------------------------------------------------------------------
-pinchtab bridge &
+pinchtab server &
 PINCHTAB_PID=$!
 
 # Wait for pinchtab to bind its port (poll /health, up to 30 s).

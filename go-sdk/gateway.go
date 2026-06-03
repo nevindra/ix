@@ -24,8 +24,16 @@ import (
 // relayed faithfully (status + body, raw bytes for screenshot/pdf).
 //
 // Pinchtab API verified against /home/nezhifi/Development/sandbox/pinchtab:
+//   - POST /profiles {"name"} -> 200 {"id","name"} (409 if it already exists);
+//     a profile MUST exist before /instances/start will accept its profileId
+//     (internal/profiles/handlers.go:handleCreate,
+//     internal/orchestrator/handlers_profiles.go:resolveProfileName)
 //   - POST /instances/start {"profileId","mode"} -> 201 {"id","profileName",...}
 //     (internal/orchestrator/handlers_instances.go:280, internal/api/types/types.go:35)
+//     NB: returns while status is "starting"; Chrome boots async (monitor in
+//     internal/orchestrator/health.go flips it to "running"), so poll
+//     GET /instances/{id} until "running" before opening a tab.
+//   - GET /instances/{id} -> {"status","error",...} (handlers_instances.go:25)
 //   - POST /instances/{id}/tabs/open {"url"} -> {"tabId","url","title"}
 //     (internal/orchestrator/handlers_tabs.go:18, internal/handlers/tab_lifecycle.go:102)
 //   - tab-scoped METHOD /tabs/{id}/<op> for navigate/snapshot/text/action/find/
@@ -263,8 +271,14 @@ func (g *Gateway) makeBrowserHandler(name string, op browserOp) http.HandlerFunc
 			return
 		}
 
-		// Resolve (or provision) the chat's instance+tab.
-		ci, err := g.ensureChat(r.Context(), chatID)
+		// Resolve (or provision) the chat's instance+tab. On a navigate, open the
+		// tab directly at the target URL so it is non-transient and routable
+		// (see openTab); other ops provision a blank tab.
+		var initialURL string
+		if name == "navigate" {
+			initialURL = navigateURL(body)
+		}
+		ci, err := g.ensureChat(r.Context(), chatID, initialURL)
 		if err != nil {
 			g.logger.Error("gateway: provision chat failed", "chat", chatID, "error", err)
 			http.Error(w, "provision browser instance: "+err.Error(), http.StatusBadGateway)
@@ -316,6 +330,31 @@ func (g *Gateway) forward(w http.ResponseWriter, r *http.Request, op browserOp, 
 	}
 	defer resp.Body.Close()
 
+	// pinchtab returns 409 "navigation_changed" when an action (e.g. a click on a
+	// link) causes the page to navigate. For an agent that is a normal, successful
+	// outcome — the click landed and the page changed — not an error. Surfacing it
+	// as an HTTP error makes the daemon return a confusing 500. Convert it into a
+	// success result that reports the navigation so the caller knows to re-snapshot.
+	if resp.StatusCode == http.StatusConflict {
+		raw, _ := io.ReadAll(resp.Body)
+		if msg, ok := navigationChangedMessage(raw); ok {
+			out, _ := json.Marshal(map[string]any{"success": true, "message": msg})
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(out)
+			return
+		}
+		// Some other conflict — relay it verbatim.
+		if ct := resp.Header.Get("Content-Type"); ct != "" {
+			w.Header().Set("Content-Type", ct)
+		} else if !op.rawBody {
+			w.Header().Set("Content-Type", "application/json")
+		}
+		w.WriteHeader(resp.StatusCode)
+		_, _ = w.Write(raw)
+		return
+	}
+
 	// Relay Content-Type (important for raw bytes: image/png, application/pdf).
 	if ct := resp.Header.Get("Content-Type"); ct != "" {
 		w.Header().Set("Content-Type", ct)
@@ -324,6 +363,24 @@ func (g *Gateway) forward(w http.ResponseWriter, r *http.Request, op browserOp, 
 	}
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
+}
+
+// navigationChangedMessage reports whether a pinchtab error body is a
+// "navigation_changed" conflict (an action triggered a page navigation) and, if
+// so, returns a human-readable message describing the navigation.
+func navigationChangedMessage(body []byte) (string, bool) {
+	var e struct {
+		Code  string `json:"code"`
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(body, &e); err != nil || e.Code != "navigation_changed" {
+		return "", false
+	}
+	msg := strings.TrimSpace(e.Error)
+	if msg == "" {
+		msg = "the action navigated the page"
+	}
+	return msg, true
 }
 
 func (g *Gateway) applyAuth(req *http.Request) {
@@ -335,8 +392,10 @@ func (g *Gateway) applyAuth(req *http.Request) {
 // ---- chat lifecycle ----
 
 // ensureChat returns the existing binding for chatID, provisioning a new
-// pinchtab instance + tab if none exists yet.
-func (g *Gateway) ensureChat(ctx context.Context, chatID string) (*chatInstance, error) {
+// pinchtab instance + tab if none exists yet. initialURL, when non-empty, is the
+// URL the freshly-opened tab is navigated to so it is routable (see openTab); it
+// is ignored when a binding already exists.
+func (g *Gateway) ensureChat(ctx context.Context, chatID, initialURL string) (*chatInstance, error) {
 	g.mu.Lock()
 	if ci, ok := g.chats[chatID]; ok {
 		g.mu.Unlock()
@@ -350,7 +409,14 @@ func (g *Gateway) ensureChat(ctx context.Context, chatID string) (*chatInstance,
 	if err != nil {
 		return nil, fmt.Errorf("start instance: %w", err)
 	}
-	tabID, err := g.openTab(ctx, instanceID)
+	// /instances/start returns immediately with status "starting" while Chrome
+	// boots in the background; opening a tab before the instance is "running"
+	// 503s ("instance is not running"). Wait for readiness first.
+	if err := g.waitInstanceRunning(ctx, instanceID); err != nil {
+		_ = g.stopInstance(context.WithoutCancel(ctx), instanceID)
+		return nil, fmt.Errorf("wait instance running: %w", err)
+	}
+	tabID, err := g.openTab(ctx, instanceID, initialURL)
 	if err != nil {
 		// Best-effort cleanup of the orphaned instance.
 		_ = g.stopInstance(context.WithoutCancel(ctx), instanceID)
@@ -370,8 +436,43 @@ func (g *Gateway) ensureChat(ctx context.Context, chatID string) (*chatInstance,
 	return ci, nil
 }
 
+// ensureProfile idempotently creates the pinchtab profile that backs a chat.
+// pinchtab's /instances/start resolves "profileId" against EXISTING profiles and
+// returns 404 ("profile not found") if it has never been created
+// (internal/orchestrator/handlers_profiles.go:resolveProfileName). A stable
+// per-chat profile name also reuses the on-disk profile dir across instance
+// restarts, so cookies/sessions survive. POST /profiles returns 200 on create
+// and 409 ("already exists") on a repeat — both mean "the profile is ready", so
+// 409 is treated as success to stay idempotent across reconnects.
+func (g *Gateway) ensureProfile(ctx context.Context, chatID string) error {
+	reqBody, _ := json.Marshal(map[string]string{"name": "chat-" + chatID})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, g.baseURL+"/profiles", bytes.NewReader(reqBody))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	g.applyAuth(req)
+
+	resp, err := g.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	switch {
+	case resp.StatusCode >= 200 && resp.StatusCode < 300, resp.StatusCode == http.StatusConflict:
+		return nil
+	default:
+		return fmt.Errorf("pinchtab POST /profiles: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+}
+
 // startInstance creates a pinchtab instance for the chat and returns its ID.
 func (g *Gateway) startInstance(ctx context.Context, chatID string) (string, error) {
+	// The profile must exist before /instances/start can resolve its profileId.
+	if err := g.ensureProfile(ctx, chatID); err != nil {
+		return "", fmt.Errorf("ensure profile: %w", err)
+	}
 	reqBody, _ := json.Marshal(map[string]string{
 		"mode":      "headless",
 		"profileId": "chat-" + chatID,
@@ -388,19 +489,71 @@ func (g *Gateway) startInstance(ctx context.Context, chatID string) (string, err
 	return out.ID, nil
 }
 
-// openTab opens a tab in the given instance and returns its tab ID.
-func (g *Gateway) openTab(ctx context.Context, instanceID string) (string, error) {
+// openTab opens a tab in the given instance and returns its tab ID. When
+// initialURL is non-empty the tab is navigated to it on open; this is essential,
+// not cosmetic: pinchtab's GET /tabs (used by the orchestrator's tab-owner
+// routing) filters out transient URLs like about:blank
+// (internal/handlers/health_tabs.go:IsTransientURL), so a tab opened blank is
+// invisible to routing and every later /tabs/{id}/<op> 404s with "tab not found"
+// whenever more than one instance is running. Opening straight to the target URL
+// makes the tab non-transient and routable.
+func (g *Gateway) openTab(ctx context.Context, instanceID, initialURL string) (string, error) {
 	var out struct {
 		TabID string `json:"tabId"`
 	}
+	reqBody, _ := json.Marshal(map[string]string{"url": initialURL})
 	path := "/instances/" + instanceID + "/tabs/open"
-	if err := g.upstreamJSON(ctx, http.MethodPost, path, []byte(`{}`), &out); err != nil {
+	if err := g.upstreamJSON(ctx, http.MethodPost, path, reqBody, &out); err != nil {
 		return "", err
 	}
 	if out.TabID == "" {
 		return "", fmt.Errorf("pinchtab returned empty tab id")
 	}
 	return out.TabID, nil
+}
+
+// Instance readiness polling. pinchtab's monitor gives the child Chrome up to
+// instanceStartupTimeout (45s, internal/orchestrator/health.go) to pass its
+// health probe before marking the instance "error", so the gateway waits a hair
+// longer than that before giving up.
+const (
+	instanceReadyTimeout      = 50 * time.Second
+	instanceReadyPollInterval = 300 * time.Millisecond
+)
+
+// waitInstanceRunning polls GET /instances/{id} until the instance reports
+// "running". A terminal status ("error"/"stopped") fails fast so we don't burn
+// the whole timeout on an instance that already gave up.
+func (g *Gateway) waitInstanceRunning(ctx context.Context, instanceID string) error {
+	deadline := time.Now().Add(instanceReadyTimeout)
+	last := "starting"
+	for {
+		var out struct {
+			Status string `json:"status"`
+			Error  string `json:"error"`
+		}
+		if err := g.upstreamJSON(ctx, http.MethodGet, "/instances/"+instanceID, nil, &out); err != nil {
+			return err
+		}
+		last = out.Status
+		switch out.Status {
+		case "running":
+			return nil
+		case "error", "stopped":
+			if out.Error != "" {
+				return fmt.Errorf("instance %s entered %q: %s", instanceID, out.Status, out.Error)
+			}
+			return fmt.Errorf("instance %s entered %q before becoming ready", instanceID, out.Status)
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("instance %s not running after %s (last status %q)", instanceID, instanceReadyTimeout, last)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(instanceReadyPollInterval):
+		}
+	}
 }
 
 // stopInstance stops a pinchtab instance (best-effort).
@@ -569,6 +722,18 @@ func parseEgressHeader(raw string) EgressPolicy {
 		return EgressPolicy{Enabled: false}
 	}
 	return p
+}
+
+// navigateURL extracts the raw "url" field from a navigate request body.
+// Returns "" if absent or unparseable.
+func navigateURL(body []byte) string {
+	var req struct {
+		URL string `json:"url"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		return ""
+	}
+	return req.URL
 }
 
 // navigateHost extracts the host from a navigate request body {"url":...}.

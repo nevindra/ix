@@ -3,6 +3,7 @@ package ix
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"os/exec"
@@ -191,14 +192,21 @@ func runIP(ctx context.Context, args ...string) error {
 	return nil
 }
 
-// runIPIgnoreExists is like runIP but treats "File exists" as success, for
-// idempotent create operations.
+// runIPIgnoreExists is like runIP but treats an "already there" result as
+// success, so create/add operations are idempotent across restarts (e.g. a
+// prior run that crashed or failed before teardown, leaving ixgw0 + its address
+// in place). `ip link add` reports "File exists"; `ip addr add` reports
+// "Address already assigned" — accept both.
 func runIPIgnoreExists(ctx context.Context, args ...string) error {
 	out, err := exec.CommandContext(ctx, "ip", args...).CombinedOutput()
-	if err != nil && !strings.Contains(string(out), "File exists") {
-		return fmt.Errorf("ip %v: %w: %s", args, err, out)
+	if err == nil {
+		return nil
 	}
-	return nil
+	s := string(out)
+	if strings.Contains(s, "File exists") || strings.Contains(s, "Address already assigned") {
+		return nil
+	}
+	return fmt.Errorf("ip %v: %w: %s", args, err, out)
 }
 
 // setupTap derives the addressing for index n, removes any stale same-name tap,
@@ -237,6 +245,79 @@ func ensureHostNAT(ctx context.Context, cidr, egressIface string) error {
 		return fmt.Errorf("apply nft ix-nat: %w: %s", err, out)
 	}
 	return nil
+}
+
+// tapIptablesIface is the iptables interface wildcard matching every per-VM TAP
+// (iptables uses a trailing '+', not a glob).
+const tapIptablesIface = "ixtap+"
+
+// forwardRule builds an iptables rule-spec (without the -C/-I/-D verb) that
+// accepts TAP traffic in one direction within `chain`. dirFlag is "-i" or "-o".
+func forwardRule(chain, dirFlag string) []string {
+	return []string{chain, dirFlag, tapIptablesIface, "-j", "ACCEPT"}
+}
+
+// forwardChain picks where to add the accept rules: Docker's DOCKER-USER chain
+// when present (its sanctioned, drop-policy-surviving extension point), else the
+// raw FORWARD chain.
+func forwardChain(dockerUserExists bool) string {
+	if dockerUserExists {
+		return "DOCKER-USER"
+	}
+	return "FORWARD"
+}
+
+// dockerUserChainExists reports whether the iptables DOCKER-USER chain is
+// present (`iptables -S DOCKER-USER` exits 0 only if so).
+func dockerUserChainExists(ctx context.Context) bool {
+	return exec.CommandContext(ctx, "iptables", "-S", "DOCKER-USER").Run() == nil
+}
+
+// ensureIptablesRule inserts an iptables FORWARD-path rule unless it is already
+// present (checked with -C so repeated manager starts do not stack duplicates).
+func ensureIptablesRule(ctx context.Context, rule []string) error {
+	if exec.CommandContext(ctx, "iptables", append([]string{"-C"}, rule...)...).Run() == nil {
+		return nil // already present
+	}
+	if out, err := exec.CommandContext(ctx, "iptables", append([]string{"-I"}, rule...)...).CombinedOutput(); err != nil {
+		return fmt.Errorf("iptables -I %v: %w: %s", rule, err, out)
+	}
+	return nil
+}
+
+// ensureForwardAccept makes the iptables FORWARD path accept traffic to/from our
+// TAP devices. This is required on hosts where another component sets the
+// FORWARD policy to DROP (Docker does this): our masquerade/accept live in a
+// separate nftables base chain, and netfilter drops a packet if ANY base chain
+// at the forward hook drops it — so an nft `accept` cannot override an iptables
+// `DROP`. Best-effort by design: if iptables is absent we assume the host has no
+// DROP policy (plain forwarding works) and only warn.
+func ensureForwardAccept(ctx context.Context, logger *slog.Logger) error {
+	if _, err := exec.LookPath("iptables"); err != nil {
+		if logger != nil {
+			logger.Warn("iptables not found; skipping FORWARD accept rules — " +
+				"VM egress will break if a DROP forward policy (e.g. Docker) is present")
+		}
+		return nil
+	}
+	chain := forwardChain(dockerUserChainExists(ctx))
+	for _, dir := range []string{"-i", "-o"} {
+		if err := ensureIptablesRule(ctx, forwardRule(chain, dir)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// teardownForwardAccept removes the rules ensureForwardAccept added. Best-effort.
+func teardownForwardAccept(ctx context.Context) {
+	if _, err := exec.LookPath("iptables"); err != nil {
+		return
+	}
+	chain := forwardChain(dockerUserChainExists(ctx))
+	for _, dir := range []string{"-i", "-o"} {
+		_ = exec.CommandContext(ctx, "iptables", append([]string{"-D"}, forwardRule(chain, dir)...)...).Run()
+	}
 }
 
 // detectEgressInterface returns the interface of the default route.

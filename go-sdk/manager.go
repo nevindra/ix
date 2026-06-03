@@ -201,6 +201,14 @@ func NewManager(ctx context.Context, cfg ManagerConfig) (*IXManager, error) {
 	}
 	m.accepting.Store(true)
 
+	// Clean up orphaned socket dirs from a previous manager instance. MUST run
+	// before we start any of our own VMs (browser tier, pool): recover() removes
+	// every /tmp/ix-* dir not in m.sandboxes, so running it after startBrowserTier
+	// would delete the just-booted tier's vsock socket (it lives in m.tier).
+	if err := m.recover(mCtx); err != nil {
+		m.logger.Warn("recover failed", "error", err)
+	}
+
 	if !cfg.DisableNetworking {
 		egress := cfg.EgressInterface
 		if egress == "" {
@@ -214,6 +222,12 @@ func NewManager(ctx context.Context, cfg ManagerConfig) (*IXManager, error) {
 		if err := ensureHostNAT(mCtx, cfg.NetworkCIDR, egress); err != nil {
 			cancel()
 			return nil, fmt.Errorf("ensure host NAT: %w", err)
+		}
+		// Survive a DROP forward policy (e.g. Docker's): an nft accept cannot
+		// override an iptables FORWARD DROP, so add an explicit accept there.
+		if err := ensureForwardAccept(mCtx, cfg.Logger); err != nil {
+			cancel()
+			return nil, fmt.Errorf("ensure forward accept: %w", err)
 		}
 		if cfg.BrowserMode == "remote" {
 			gwIP, err := parseGatewayIP(cfg.GatewayListenAddr)
@@ -265,11 +279,6 @@ func NewManager(ctx context.Context, cfg ManagerConfig) (*IXManager, error) {
 				m.logger.Error("golden snapshot failed, falling back to cold boot", "error", err)
 			}
 		}()
-	}
-
-	// Recover / clean up orphaned socket dirs from a previous run.
-	if err := m.recover(mCtx); err != nil {
-		m.logger.Warn("recover failed", "error", err)
 	}
 
 	go m.monitor(mCtx)
@@ -470,12 +479,16 @@ func (m *IXManager) Close() error {
 	m.tier.stop(m.vmm)
 
 	// One manager owns the host's networking. The ix-nat table and ip_forward
-	// are host-wide and idempotent, so they are left in place; only the gateway
-	// dummy interface (browser-remote only) is removed here. Running multiple
-	// managers on one host is not supported (tap names and ixgw0 are global).
-	if m.cfg.BrowserMode == "remote" && !m.cfg.DisableNetworking {
-		if err := teardownGatewayAddr(context.Background()); err != nil {
-			m.logger.Warn("teardown gateway addr", "error", err)
+	// are host-wide and idempotent, so they are left in place; the iptables
+	// forward-accept rules and the gateway dummy interface (browser-remote only)
+	// are removed here. Running multiple managers on one host is not supported
+	// (tap names and ixgw0 are global).
+	if !m.cfg.DisableNetworking {
+		teardownForwardAccept(context.Background())
+		if m.cfg.BrowserMode == "remote" {
+			if err := teardownGatewayAddr(context.Background()); err != nil {
+				m.logger.Warn("teardown gateway addr", "error", err)
+			}
 		}
 	}
 
@@ -529,8 +542,11 @@ func (m *IXManager) destroy(ctx context.Context, sessionID string) error {
 }
 
 // buildEnvSlice constructs the env var slice to pass to ix-vmm.
-// chatID is the per-sandbox session identifier; pass "" for pool entries that
-// have no assigned chat yet (IX_CHAT_ID will be omitted in that case).
+// chatID is the per-sandbox chat identifier baked into IX_CHAT_ID (used as the
+// gateway routing key for browser ops). Pass a non-empty value for any VM that
+// may serve browser requests — cold-boot uses the session id, pool entries use
+// their sandbox id (see createPoolEntry). Empty omits IX_CHAT_ID entirely, which
+// only suits VMs that will never touch the browser tier.
 // browser controls browser-mode injection:
 //   - nil  = manager default (browser via shared tier when BrowserGatewayURL is set)
 //   - true = explicitly request browser via shared tier
@@ -753,7 +769,12 @@ func (m *IXManager) createPoolEntry(ctx context.Context) (*poolEntry, error) {
 		memMB = 128
 	}
 
-	envSlice := m.buildEnvSlice(nil, "", nil) // pool entries have no assigned chat id yet
+	// Pool entries have no conversation assigned yet, but the daemon bakes its
+	// chat id from IX_CHAT_ID at boot and a claimed VM serves exactly one chat
+	// for its lifetime, so seed a stable per-VM chat id (the sandbox id). Without
+	// it a pool-served browser sandbox would send an empty X-IX-Chat-Id and the
+	// gateway rejects every browser op with 400 ("missing X-IX-Chat-Id header").
+	envSlice := m.buildEnvSlice(nil, sandboxID, nil)
 
 	handle, err := m.vmm.startVM(ctx, sandboxID, vcpus, memMB, m.cfg.RootfsImage, envSlice, nil)
 	if err != nil {

@@ -77,6 +77,15 @@ code is removed.
   oifname <egress>`) and a forward-accept rule for tap traffic. Re-runnable
   (flush chain, re-add rule) so no duplicate rules. (`nft` v1.1.6 confirmed on
   the host; auto-detected egress iface on this host = `enp6s0`.)
+- `ensureForwardAccept() error` — **idempotent, once at manager start**, right
+  after `ensureHostNAT`. Inserts an `iptables` ACCEPT for `ixtap+` traffic into
+  `DOCKER-USER` (when that chain exists) or `FORWARD`. **Required because the nft
+  forward-accept above is not sufficient on its own:** netfilter drops a packet
+  if *any* base chain at the forward hook drops it, and Docker sets the iptables
+  `FORWARD` policy to `DROP` — an nft `accept` cannot override an iptables
+  `DROP` at the same hook. Best-effort: if `iptables` is absent it only warns
+  (assumes no DROP policy). Verified on the dev host (Docker present, `-P FORWARD
+  DROP`): without this, all VM egress times out even to raw IPs.
 - `detectEgressInterface() (string, error)` — first `dev` of the default route
   (`ip route show default`), overridable via config.
 - `ensureGatewayAddr(gatewayIP string) error` — **idempotent, once at manager
@@ -220,10 +229,17 @@ and gates allow/deny; NAT only provides L3 reachability. They compose.
 
 ## Operator notes
 
-- Grant `CAP_NET_ADMIN` to the manager (`setcap cap_net_admin+ep …` or systemd
-  `AmbientCapabilities`).
+- Grant `CAP_NET_ADMIN` to the manager. Run as **root** or, for a non-root
+  systemd service, set `AmbientCapabilities=CAP_NET_ADMIN` (ambient caps
+  propagate to the `ip`/`nft`/`iptables`/`sysctl` children). Plain
+  `setcap cap_net_admin+ep` on the binary does **not** work — the cap is not in
+  the inheritable/ambient set, so the shelled-out children get nothing.
 - NAT + `ip_forward` are **host-wide** changes the manager applies at startup
   (idempotent). The `nft` table is named `ix-nat` for easy inspection/removal.
+- **Docker (or any `-P FORWARD DROP`) on the host:** the manager adds an
+  `iptables` ACCEPT for `ixtap+` to `DOCKER-USER`/`FORWARD` (see
+  `ensureForwardAccept`). Without it the masquerade never runs and VM egress
+  times out. The container/host needs the `iptables` binary on its `PATH`.
 - `EgressInterface` override for hosts with non-obvious default routes.
 - Browser-remote only: the manager pins the Gateway's link-local IP
   (`169.254.0.1`) on a host dummy interface `ixgw0` at startup (idempotent) so
@@ -235,5 +251,6 @@ and gates allow/deny; NAT only provides L3 reachability. They compose.
   are global; the allocator is per-manager. Running multiple managers on one
   host is **not supported** (they would collide on tap names and tear down each
   other's `ixgw0`). The host-wide `ix-nat` table and `ip_forward` are left in
-  place on shutdown (idempotent); only `ixgw0` is removed.
+  place on shutdown (idempotent); the `iptables` forward-accept rules and
+  `ixgw0` are removed.
 ```

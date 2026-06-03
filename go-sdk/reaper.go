@@ -94,6 +94,12 @@ func (m *IXManager) recover(ctx context.Context) error {
 	if m.cfg.SnapshotDir != "" {
 		active[m.cfg.SnapshotDir] = true
 	}
+	// The browser-tier VM lives in m.tier, not m.sandboxes, so the loop above
+	// misses its socket dir. Protect it so a later recover() never deletes the
+	// live tier's vsock socket out from under the gateway.
+	if m.tier != nil && m.tier.vmm != nil && m.tier.vmm.SocketDir != "" {
+		active[m.tier.vmm.SocketDir] = true
+	}
 
 	tmpDir := os.TempDir()
 	entries, err := os.ReadDir(tmpDir)

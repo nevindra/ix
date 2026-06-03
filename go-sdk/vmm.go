@@ -195,6 +195,13 @@ func (fb *firecrackerBackend) startVMCold(ctx context.Context, sandboxID string,
 	cmd.Dir = socketDir
 	cmd.Stdout = nil
 	cmd.Stderr = nil
+	// The guest serial console (console=ttyS0) is routed to Firecracker's stdout.
+	// Discarded by default; set IX_VM_CONSOLE=1 to surface boot + init logs on
+	// stderr for debugging (e.g. why the browser-tier pinchtab never gets healthy).
+	if os.Getenv("IX_VM_CONSOLE") != "" {
+		cmd.Stdout = os.Stderr
+		cmd.Stderr = os.Stderr
+	}
 
 	if err := cmd.Start(); err != nil {
 		cleanupOnErr(nil)

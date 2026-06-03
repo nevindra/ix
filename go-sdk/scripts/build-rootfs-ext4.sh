@@ -102,11 +102,15 @@ INIT_SCRIPT_DONE=1
 
 install_browser_vm_init() {
   local temp_dir="$1"
-  # The browser-vm Docker stage already COPYs browser-vm-init to
-  # /usr/local/bin/browser-vm-init and chmod +x it. Verify it is present so a
-  # mis-tagged image fails loudly instead of producing an unbootable rootfs.
-  if [[ ! -x "${temp_dir}/usr/local/bin/browser-vm-init" ]]; then
-    echo "Error: browser-vm rootfs missing /usr/local/bin/browser-vm-init — did you build the browser-vm Docker stage?" >&2
+  # Prefer the in-repo browser-vm-init over the (possibly stale) copy baked into
+  # the Docker image, so init changes take effect on a rootfs rebuild without a
+  # full image rebuild — mirrors how ix-init.sh is handled for the other tiers.
+  local init_src="${SCRIPT_DIR}/../../daemon/cmd/browser-vm-init.sh"
+  if [[ -f "$init_src" ]]; then
+    sudo install -m 755 "$init_src" "${temp_dir}/usr/local/bin/browser-vm-init"
+    echo "✓ browser-vm-init overlaid from repo (${init_src})"
+  elif [[ ! -x "${temp_dir}/usr/local/bin/browser-vm-init" ]]; then
+    echo "Error: browser-vm rootfs missing /usr/local/bin/browser-vm-init and no repo source at ${init_src}" >&2
     return 1
   fi
   # Symlink /sbin/ix-init -> browser-vm-init so a fixed kernel init= path works

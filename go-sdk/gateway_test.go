@@ -31,8 +31,17 @@ type mockPinchtab struct {
 	startCount atomic.Int32
 	stopCount  atomic.Int32
 
+	// profileCount counts /profiles calls (to assert per-chat create + reuse).
+	profileCount atomic.Int32
+
+	// actionNavConflict, when set, makes /tabs/{id}/action return pinchtab's
+	// 409 navigation_changed (a click that triggered a page navigation).
+	actionNavConflict atomic.Bool
+
 	// lastProfileID captures the profileId sent on the most recent start.
 	lastProfileID atomic.Value // string
+	// lastProfileName captures the name sent on the most recent /profiles create.
+	lastProfileName atomic.Value // string
 }
 
 func newMockPinchtab() *mockPinchtab {
@@ -74,6 +83,23 @@ func (m *mockPinchtab) handler() http.Handler {
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	})
 
+	mux.HandleFunc("POST /profiles", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		m.record(r, string(body))
+		m.profileCount.Add(1)
+		var req struct {
+			Name string `json:"name"`
+		}
+		_ = json.Unmarshal(body, &req)
+		m.lastProfileName.Store(req.Name)
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status": "created",
+			"id":     "prof_" + req.Name,
+			"name":   req.Name,
+		})
+	})
+
 	mux.HandleFunc("POST /instances/start", func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		m.record(r, string(body))
@@ -92,6 +118,15 @@ func (m *mockPinchtab) handler() http.Handler {
 			"port":        "9001",
 			"mode":        req.Mode,
 			"status":      "running",
+		})
+	})
+
+	mux.HandleFunc("GET /instances/{id}", func(w http.ResponseWriter, r *http.Request) {
+		m.record(r, "")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id":     r.PathValue("id"),
+			"status": "running",
 		})
 	})
 
@@ -150,6 +185,15 @@ func (m *mockPinchtab) handler() http.Handler {
 	mux.HandleFunc("POST /tabs/{id}/action", func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		m.record(r, string(body))
+		if m.actionNavConflict.Load() {
+			// Mimic pinchtab when a click triggers a page navigation.
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"code":  "navigation_changed",
+				"error": "unexpected page navigation: https://a.test/ -> https://a.test/page",
+			})
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
 	})
@@ -217,7 +261,9 @@ func TestGateway_FirstNavigateProvisionsThenReuses(t *testing.T) {
 
 	seq := mock.callSeq()
 	want := []string{
+		"POST /profiles",
 		"POST /instances/start",
+		"GET /instances/" + mock.instanceID,
 		"POST /instances/" + mock.instanceID + "/tabs/open",
 		"POST /tabs/" + mock.tabID + "/navigate",
 	}
@@ -230,18 +276,24 @@ func TestGateway_FirstNavigateProvisionsThenReuses(t *testing.T) {
 		}
 	}
 
-	// profileId must be chat-<id>.
+	// profileId must be chat-<id>, and the profile must have been created first.
 	if got, _ := mock.lastProfileID.Load().(string); got != "chat-chat1" {
 		t.Fatalf("profileId = %q, want %q", got, "chat-chat1")
 	}
+	if got, _ := mock.lastProfileName.Load().(string); got != "chat-chat1" {
+		t.Fatalf("profile name = %q, want %q", got, "chat-chat1")
+	}
 
-	// Second navigate for same chat: no new /instances/start.
+	// Second navigate for same chat: no new /profiles or /instances/start.
 	rec2 := doReq(t, h, http.MethodPost, "/v1/browser/navigate", "chat1", nil, `{"url":"https://example.com/page2"}`)
 	if rec2.Code != http.StatusOK {
 		t.Fatalf("second navigate status = %d, want 200", rec2.Code)
 	}
 	if got := mock.startCount.Load(); got != 1 {
 		t.Fatalf("instances/start called %d times, want 1 (instance should be reused)", got)
+	}
+	if got := mock.profileCount.Load(); got != 1 {
+		t.Fatalf("/profiles called %d times, want 1 (profile should be reused)", got)
 	}
 }
 
@@ -297,6 +349,45 @@ func TestGateway_EgressAllowedForwards(t *testing.T) {
 	seq := mock.callSeq()
 	if len(seq) == 0 || seq[len(seq)-1] != "POST /tabs/"+mock.tabID+"/navigate" {
 		t.Fatalf("allowed navigate should reach pinchtab navigate; seq=%v", seq)
+	}
+}
+
+// --- action that navigates the page becomes a success, not a 409/500 ---
+
+func TestGateway_ActionNavigationChangedBecomesSuccess(t *testing.T) {
+	g, mock, cleanup := newTestGateway(t)
+	defer cleanup()
+	h := g.Handler()
+	mock.actionNavConflict.Store(true)
+
+	rec := doReq(t, h, http.MethodPost, "/v1/browser/action", "chat1", nil, `{"kind":"click","ref":"e113"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("navigating click status = %d, want 200 (409 navigation_changed must convert to success); body=%s", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		Success bool   `json:"success"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode body: %v (body=%s)", err, rec.Body.String())
+	}
+	if !out.Success {
+		t.Fatalf("converted result should be success=true; body=%s", rec.Body.String())
+	}
+	if !strings.Contains(out.Message, "navigation") {
+		t.Fatalf("message should describe the navigation, got %q", out.Message)
+	}
+}
+
+func TestNavigationChangedMessage(t *testing.T) {
+	if msg, ok := navigationChangedMessage([]byte(`{"code":"navigation_changed","error":"unexpected page navigation: a -> b"}`)); !ok || !strings.Contains(msg, "a -> b") {
+		t.Fatalf("navigation_changed body should parse; ok=%v msg=%q", ok, msg)
+	}
+	if _, ok := navigationChangedMessage([]byte(`{"code":"other","error":"x"}`)); ok {
+		t.Fatalf("non-navigation_changed code must not match")
+	}
+	if _, ok := navigationChangedMessage([]byte(`not json`)); ok {
+		t.Fatalf("invalid JSON must not match")
 	}
 }
 

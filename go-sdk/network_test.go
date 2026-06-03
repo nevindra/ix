@@ -38,6 +38,26 @@ func TestDeriveVMNet(t *testing.T) {
 	}
 }
 
+func TestForwardRule(t *testing.T) {
+	in := forwardRule("DOCKER-USER", "-i")
+	if got, want := strings.Join(in, " "), "DOCKER-USER -i ixtap+ -j ACCEPT"; got != want {
+		t.Errorf("forwardRule(-i) = %q, want %q", got, want)
+	}
+	out := forwardRule("FORWARD", "-o")
+	if got, want := strings.Join(out, " "), "FORWARD -o ixtap+ -j ACCEPT"; got != want {
+		t.Errorf("forwardRule(-o) = %q, want %q", got, want)
+	}
+}
+
+func TestForwardChain(t *testing.T) {
+	if got := forwardChain(true); got != "DOCKER-USER" {
+		t.Errorf("forwardChain(true) = %q, want DOCKER-USER", got)
+	}
+	if got := forwardChain(false); got != "FORWARD" {
+		t.Errorf("forwardChain(false) = %q, want FORWARD", got)
+	}
+}
+
 func TestTapAllocatorSequential(t *testing.T) {
 	a := newTapAllocator(0)
 	for want := 0; want < 5; want++ {
