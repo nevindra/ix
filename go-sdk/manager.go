@@ -91,6 +91,14 @@ func (c *ManagerConfig) applyDefaults() {
 		if c.GatewayListenAddr == "" {
 			c.GatewayListenAddr = defaultGatewayListenAddr
 		}
+		if c.GatewayToken == "" {
+			// pinchtab requires a non-empty token. Default to the shared internal
+			// token the guest's browser-vm-init also defaults to, so the host
+			// Gateway and guest pinchtab agree with zero operator config. The
+			// Gateway is link-local and pinchtab is guest-local (vsock-only), so
+			// this is not externally reachable; override via GatewayToken for prod.
+			c.GatewayToken = defaultGatewayToken
+		}
 	}
 }
 

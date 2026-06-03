@@ -255,10 +255,19 @@ func (sm *SnapshotManager) Restore(ctx context.Context, sandboxID string) (*VMMH
 	}, nil
 }
 
-// waitHealthy polls GET /health on the given HTTP client until the guest daemon
-// responds with HTTP 200, or until the context deadline / 10 s timeout expires.
+// waitHealthy polls GET /health until the guest daemon responds with HTTP 200,
+// or until the context deadline / 10 s timeout expires. Used by snapshot restore
+// (ixd's /health needs no auth).
 func waitHealthy(ctx context.Context, httpClient *http.Client) error {
-	deadline := time.Now().Add(10 * time.Second)
+	return waitHealthyAuth(ctx, httpClient, "", 10*time.Second)
+}
+
+// waitHealthyAuth polls GET /health until HTTP 200, sending an optional Bearer
+// token, until ctx is done or the timeout expires. The browser tier uses this
+// because pinchtab's /health requires the Authorization header and Chrome
+// cold-start can exceed the snapshot-restore 10 s budget.
+func waitHealthyAuth(ctx context.Context, httpClient *http.Client, bearer string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 
@@ -268,11 +277,14 @@ func waitHealthy(ctx context.Context, httpClient *http.Client) error {
 			return ctx.Err()
 		case <-ticker.C:
 			if time.Now().After(deadline) {
-				return fmt.Errorf("guest daemon health check timed out after 10s")
+				return fmt.Errorf("guest daemon health check timed out after %s", timeout)
 			}
 			req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://localhost/health", nil)
 			if err != nil {
 				return fmt.Errorf("build health request: %w", err)
+			}
+			if bearer != "" {
+				req.Header.Set("Authorization", "Bearer "+bearer)
 			}
 			resp, err := httpClient.Do(req)
 			if err != nil {

@@ -78,8 +78,10 @@ FROM browser AS browser-vm
 
 # socat: bridges AF_VSOCK (Firecracker host→guest) to pinchtab's TCP listener.
 # wget: used by browser-vm-init.sh to health-poll pinchtab before socat starts.
+# iproute2: `ip link set lo up` — Firecracker guests boot with loopback DOWN,
+# and pinchtab/socat both use 127.0.0.1, which is unreachable until lo is up.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        socat wget \
+        socat wget iproute2 \
     && rm -rf /var/lib/apt/lists/*
 
 # Persistent browser-state directory (Chrome profiles / cookies).

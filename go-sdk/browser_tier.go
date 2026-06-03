@@ -14,6 +14,12 @@ import (
 // applyDefaults and gatewayURLFromAddr so the two never silently diverge.
 const defaultGatewayListenAddr = "169.254.0.1:9100"
 
+// defaultGatewayToken is the fixed internal token shared by the host Gateway and
+// the guest pinchtab (browser-vm-init defaults to the same value) when no
+// operator token is set. pinchtab rejects an empty token, so a default is
+// required for zero-config boot. Not externally reachable (link-local + vsock).
+const defaultGatewayToken = "ix-internal"
+
 // browserTier owns the shared browser-tier VM and its Gateway HTTP server.
 // The TCP listener is owned by server: http.Server.Shutdown closes it, so it is
 // not retained separately.
@@ -57,9 +63,11 @@ func startBrowserTier(ctx context.Context, fb *firecrackerBackend, cfg ManagerCo
 		return nil, "", fmt.Errorf("boot browser-tier VM: %w", err)
 	}
 
-	// Wait for pinchtab /health via the vsock transport (mirrors snapshot.Restore).
+	// Wait for pinchtab /health via the vsock transport. pinchtab requires the
+	// Bearer token on /health, and Chrome cold-start can exceed the snapshot 10 s
+	// budget, so use a longer authenticated wait.
 	guestHTTP := &http.Client{Transport: vsockTransport(handle.VsockPath), Timeout: 2 * time.Second}
-	if err := waitHealthy(ctx, guestHTTP); err != nil {
+	if err := waitHealthyAuth(ctx, guestHTTP, cfg.GatewayToken, 60*time.Second); err != nil {
 		fb.cleanup(handle)
 		return nil, "", fmt.Errorf("browser-tier pinchtab health: %w", err)
 	}

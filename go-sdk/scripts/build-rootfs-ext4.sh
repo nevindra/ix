@@ -110,10 +110,12 @@ install_browser_vm_init() {
     return 1
   fi
   # Symlink /sbin/ix-init -> browser-vm-init so a fixed kernel init= path works
-  # for both tiers (kernel boot args use init=/sbin/ix-init). Use a relative
-  # target so the link resolves correctly whether the rootfs is the live VM
-  # root or inspected while mounted under a prefix.
-  sudo ln -sf ../usr/local/bin/browser-vm-init "${temp_dir}/sbin/ix-init"
+  # for both tiers (kernel boot args use init=/sbin/ix-init). Use an ABSOLUTE
+  # target: the Ubuntu base usr-merges /sbin -> /usr/sbin, so this link is
+  # physically created in /usr/sbin/. A relative "../usr/local/bin/..." target
+  # would resolve from /usr/sbin/ to the non-existent /usr/usr/local/bin/... and
+  # dangle, making the kernel panic with "init failed (error -2)" at boot.
+  sudo ln -sf /usr/local/bin/browser-vm-init "${temp_dir}/sbin/ix-init"
   echo "✓ browser-vm init linked at /sbin/ix-init"
 }
 
