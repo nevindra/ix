@@ -118,7 +118,10 @@ cold-boot branch; the snapshot-restore branch is unchanged. **Implication for th
 browser-remote feature:** a snapshot-restored per-chat VM has no tap, so it can
 reach neither the internet nor the host Gateway — run per-chat VMs from the
 pre-warm pool (cold-boot) until the follow-up lands (see **Gateway
-reachability**).
+reachability**). **The golden boot (`CreateGolden`) is itself cold-booted, so it
+must skip the tap** (`startVMCold(..., forceNoNet=true)`); otherwise it would
+bake a `host_dev_name`/`ip=` into the snapshot that no longer exists at restore.
+This keeps restored clones genuinely vsock-only.
 
 **Guest:**
 
@@ -228,4 +231,9 @@ and gates allow/deny; NAT only provides L3 reachability. They compose.
   `ip addr show ixgw0`.
 - The browser-remote feature requires per-chat VMs to **cold-boot** (pre-warm
   pool); it does not work with `UseSnapshot=on` until snapshot networking lands.
+- **One manager owns the host's networking.** Tap names (`ixtap<n>`) and `ixgw0`
+  are global; the allocator is per-manager. Running multiple managers on one
+  host is **not supported** (they would collide on tap names and tear down each
+  other's `ixgw0`). The host-wide `ix-nat` table and `ip_forward` are left in
+  place on shutdown (idempotent); only `ixgw0` is removed.
 ```

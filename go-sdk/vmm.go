@@ -24,7 +24,7 @@ type VMMHandle struct {
 	VsockPath string // path to vsock UDS file (used by Firecracker vsock device)
 	APISocket string // Firecracker API socket path
 	CID       uint32 // AF_VSOCK context ID assigned to this VM
-	PasstPID  int    // passt process PID; 0 if not running
+	Net       *vmNet // per-VM TAP networking; nil = vsock-only (snapshot/disabled)
 }
 
 // FirecrackerConfig holds Firecracker-specific configuration.
@@ -74,8 +74,9 @@ func allocateCID() uint32 {
 
 // buildKernelBootArgs constructs the kernel command line for the Firecracker VM.
 // Environment variables from envSlice are injected as ix.env.KEY=VALUE entries
-// so the ix-init script can read them from /proc/cmdline.
-func buildKernelBootArgs(envSlice []string) string {
+// so the ix-init script can read them from /proc/cmdline. When net is non-nil,
+// an ip= argument autoconfigures eth0 (IP, gateway, /30 mask, DNS) at boot.
+func buildKernelBootArgs(envSlice []string, net *vmNet) string {
 	parts := []string{
 		"console=ttyS0",
 		"reboot=k",
@@ -91,6 +92,11 @@ func buildKernelBootArgs(envSlice []string) string {
 		"rw",
 		"init=/sbin/ix-init",
 	}
+	if net != nil {
+		// ip=<client>:<server>:<gw>:<mask>:<host>:<dev>:<autoconf>:<dns>
+		parts = append(parts, fmt.Sprintf(
+			"ip=%s::%s:%s::eth0:off:8.8.8.8", net.guestIP, net.hostIP, net.mask))
+	}
 	for _, e := range envSlice {
 		parts = append(parts, "ix.env."+e)
 	}
@@ -104,6 +110,8 @@ type firecrackerBackend struct {
 	rootfsImage string
 	logger      *slog.Logger
 	snapshot    *SnapshotManager // optional; when set, startVM uses snapshot restore
+	tapAlloc    *tapAllocator    // TAP index allocator (set by the manager; nil only in tests that never cold-boot)
+	disableNet  bool             // skip TAP setup entirely (vsock-only VM)
 }
 
 // startVM is the primary VM-creation entry point.  When a SnapshotManager is
@@ -117,22 +125,25 @@ func (fb *firecrackerBackend) startVM(ctx context.Context, sandboxID string, vcp
 		// tier's state disk) cold-boot via startVMCold directly.
 		return fb.snapshot.Restore(ctx, sandboxID)
 	}
-	return fb.startVMCold(ctx, sandboxID, vcpus, memMB, rootfsImage, envSlice, extraDrives)
+	return fb.startVMCold(ctx, sandboxID, vcpus, memMB, rootfsImage, envSlice, extraDrives, false)
 }
 
 // startVMCold launches a Firecracker VM and returns a VMMHandle on success.
 //
 // Sequence:
 //  1. Allocate CID and create socket dir at /tmp/ix-{sandboxID}
-//  2. Start passt for user-mode networking
+//  2. Create a per-VM TAP and wire it via PUT /network-interfaces
 //  3. Start Firecracker process with --api-sock
 //  4. Wait for API socket file to appear (5 s timeout)
 //  5. Configure VM via PUT requests to the Firecracker API
 //  6. Start the VM via PUT /actions InstanceStart
 //
-// On any error after process creation, the process and passt are killed and
+// On any error after process creation, the process and TAP are torn down and
 // the socket dir is removed before returning.
-func (fb *firecrackerBackend) startVMCold(ctx context.Context, sandboxID string, vcpus int, memMB int64, rootfsImage string, envSlice []string, extraDrives []driveSpec) (*VMMHandle, error) {
+//
+// When forceNoNet is true (used by the snapshot golden boot), no TAP is created
+// and the VM is vsock-only regardless of fb.disableNet.
+func (fb *firecrackerBackend) startVMCold(ctx context.Context, sandboxID string, vcpus int, memMB int64, rootfsImage string, envSlice []string, extraDrives []driveSpec, forceNoNet bool) (*VMMHandle, error) {
 	cid := allocateCID()
 
 	socketDir := filepath.Join(os.TempDir(), "ix-"+sandboxID)
@@ -143,105 +154,119 @@ func (fb *firecrackerBackend) startVMCold(ctx context.Context, sandboxID string,
 	apiSocket := filepath.Join(socketDir, "fc.sock")
 	vsockUDS := filepath.Join(socketDir, "vsock.uds")
 
-	// Start passt for user-mode networking (implemented in network.go — Task 3).
-	passtPID, err := startPasst(ctx, socketDir)
-	if err != nil {
-		_ = os.RemoveAll(socketDir)
-		return nil, fmt.Errorf("start passt: %w", err)
+	// Per-VM TAP networking (skipped when disabled). On any later error we must
+	// tear the tap down and release its index, so track them for the closure.
+	var vn *vmNet
+	if !fb.disableNet && !forceNoNet {
+		if fb.tapAlloc == nil {
+			_ = os.RemoveAll(socketDir)
+			return nil, fmt.Errorf("networking enabled but tap allocator not configured")
+		}
+		idx, err := fb.tapAlloc.alloc()
+		if err != nil {
+			_ = os.RemoveAll(socketDir)
+			return nil, fmt.Errorf("allocate tap index: %w", err)
+		}
+		net, err := setupTap(ctx, idx)
+		if err != nil {
+			fb.tapAlloc.release(idx)
+			_ = os.RemoveAll(socketDir)
+			return nil, fmt.Errorf("setup tap: %w", err)
+		}
+		vn = &net
 	}
 
-	// Start Firecracker process with working dir = socketDir.
-	// This makes relative paths (vsock.uds) resolve per-VM, which is
-	// critical for snapshot restore — each clone gets its own vsock UDS.
-	cmd := exec.CommandContext(ctx, fb.fcBinary,
-		"--api-sock", apiSocket,
-	)
+	// cleanupOnErr undoes everything created so far. Call on every error path
+	// after this point.
+	cleanupOnErr := func(proc *os.Process) {
+		if proc != nil {
+			_ = proc.Kill()
+		}
+		if vn != nil {
+			if err := teardownTap(context.Background(), *vn); err != nil && fb.logger != nil {
+				fb.logger.Warn("teardown tap (error path)", "tap", vn.tapName, "error", err)
+			}
+			fb.tapAlloc.release(vn.idx)
+		}
+		_ = os.RemoveAll(socketDir)
+	}
+
+	cmd := exec.CommandContext(ctx, fb.fcBinary, "--api-sock", apiSocket)
 	cmd.Dir = socketDir
 	cmd.Stdout = nil
 	cmd.Stderr = nil
 
 	if err := cmd.Start(); err != nil {
-		killPID(passtPID)
-		_ = os.RemoveAll(socketDir)
+		cleanupOnErr(nil)
 		return nil, fmt.Errorf("start firecracker: %w", err)
 	}
 
-	// Wait for API socket to appear before sending configuration.
 	if err := waitForFile(apiSocket, 5*time.Second); err != nil {
-		_ = cmd.Process.Kill()
-		killPID(passtPID)
-		_ = os.RemoveAll(socketDir)
+		cleanupOnErr(cmd.Process)
 		return nil, fmt.Errorf("firecracker API socket not ready: %w", err)
 	}
 
 	apiClient := fcAPIClient(apiSocket)
-	bootArgs := buildKernelBootArgs(envSlice)
+	bootArgs := buildKernelBootArgs(envSlice, vn)
 
-	// Configure: boot source.
 	if err := fcPut(ctx, apiClient, "/boot-source", map[string]any{
 		"kernel_image_path": fb.kernelPath,
 		"boot_args":         bootArgs,
 	}); err != nil {
-		_ = cmd.Process.Kill()
-		killPID(passtPID)
-		_ = os.RemoveAll(socketDir)
+		cleanupOnErr(cmd.Process)
 		return nil, fmt.Errorf("set boot source: %w", err)
 	}
 
-	// Configure: rootfs drive.
 	if err := fcPut(ctx, apiClient, "/drives/rootfs", map[string]any{
 		"drive_id":       "rootfs",
 		"path_on_host":   rootfsImage,
 		"is_root_device": true,
 		"is_read_only":   false,
 	}); err != nil {
-		_ = cmd.Process.Kill()
-		killPID(passtPID)
-		_ = os.RemoveAll(socketDir)
+		cleanupOnErr(cmd.Process)
 		return nil, fmt.Errorf("set rootfs drive: %w", err)
 	}
 
-	// Configure: extra (non-root) drives, e.g. the browser-tier state disk.
 	for _, d := range extraDrives {
 		id, _ := d["drive_id"].(string)
 		if err := fcPut(ctx, apiClient, "/drives/"+id, d); err != nil {
-			_ = cmd.Process.Kill()
-			killPID(passtPID)
-			_ = os.RemoveAll(socketDir)
+			cleanupOnErr(cmd.Process)
 			return nil, fmt.Errorf("set drive %s: %w", id, err)
 		}
 	}
 
-	// Configure: machine resources.
+	// Network interface (TAP). Must precede InstanceStart. Skipped when disabled.
+	if vn != nil {
+		if err := fcPut(ctx, apiClient, "/network-interfaces/eth0", map[string]any{
+			"iface_id":      "eth0",
+			"guest_mac":     vn.guestMAC,
+			"host_dev_name": vn.tapName,
+		}); err != nil {
+			cleanupOnErr(cmd.Process)
+			return nil, fmt.Errorf("set network interface: %w", err)
+		}
+	}
+
 	if err := fcPut(ctx, apiClient, "/machine-config", map[string]any{
 		"vcpu_count":   vcpus,
 		"mem_size_mib": memMB,
 	}); err != nil {
-		_ = cmd.Process.Kill()
-		killPID(passtPID)
-		_ = os.RemoveAll(socketDir)
+		cleanupOnErr(cmd.Process)
 		return nil, fmt.Errorf("set machine config: %w", err)
 	}
 
-	// Configure: vsock device. Use relative path so snapshot restores resolve
-	// per-VM (each Firecracker process has cmd.Dir = its own socketDir).
 	if err := fcPut(ctx, apiClient, "/vsock", map[string]any{
 		"guest_cid": cid,
 		"uds_path":  "vsock.uds",
 	}); err != nil {
-		_ = cmd.Process.Kill()
-		killPID(passtPID)
-		_ = os.RemoveAll(socketDir)
+		cleanupOnErr(cmd.Process)
 		return nil, fmt.Errorf("set vsock: %w", err)
 	}
 
-	// Start the VM instance.
 	if err := fcPut(ctx, apiClient, "/actions", map[string]any{
 		"action_type": "InstanceStart",
 	}); err != nil {
-		_ = cmd.Process.Kill()
-		killPID(passtPID)
-		_ = os.RemoveAll(socketDir)
+		cleanupOnErr(cmd.Process)
 		return nil, fmt.Errorf("start VM instance: %w", err)
 	}
 
@@ -251,12 +276,12 @@ func (fb *firecrackerBackend) startVMCold(ctx context.Context, sandboxID string,
 		VsockPath: vsockUDS,
 		APISocket: apiSocket,
 		CID:       cid,
-		PasstPID:  passtPID,
+		Net:       vn,
 	}, nil
 }
 
-// cleanup kills the Firecracker process, the passt process, and removes the
-// socket directory.
+// cleanup kills the Firecracker process, tears down the VM's TAP (if any), and
+// removes the socket directory.
 func (fb *firecrackerBackend) cleanup(handle *VMMHandle) {
 	if handle == nil {
 		return
@@ -265,7 +290,14 @@ func (fb *firecrackerBackend) cleanup(handle *VMMHandle) {
 		_ = handle.Process.Kill()
 		_, _ = handle.Process.Wait()
 	}
-	killPID(handle.PasstPID)
+	if handle.Net != nil {
+		if err := teardownTap(context.Background(), *handle.Net); err != nil && fb.logger != nil {
+			fb.logger.Warn("teardown tap", "tap", handle.Net.tapName, "error", err)
+		}
+		if fb.tapAlloc != nil {
+			fb.tapAlloc.release(handle.Net.idx)
+		}
+	}
 	if handle.SocketDir != "" {
 		_ = os.RemoveAll(handle.SocketDir)
 	}
@@ -306,16 +338,4 @@ func fcPut(ctx context.Context, client *http.Client, path string, body map[strin
 		return fmt.Errorf("PUT %s: HTTP %d: %s", path, resp.StatusCode, respBody)
 	}
 	return nil
-}
-
-// killPID sends SIGKILL to the given PID. No-op if pid <= 0.
-func killPID(pid int) {
-	if pid <= 0 {
-		return
-	}
-	p, err := os.FindProcess(pid)
-	if err != nil {
-		return
-	}
-	_ = p.Kill()
 }

@@ -49,8 +49,13 @@ type ManagerConfig struct {
 	BrowserVMImage    string // rootfs path for the browser-tier VM (browser-vm tier)
 	BrowserVMMemoryMB int64  // browser-tier VM memory; default 4096
 	BrowserStateImage string // optional ext4 state disk attached to the browser-tier VM; empty = ephemeral
-	GatewayListenAddr string // host addr the gateway binds, reachable from guests via passt; default "169.254.0.1:9100"
+	GatewayListenAddr string // host addr the gateway binds, reachable from guests via their per-VM TAP route; default "169.254.0.1:9100"
 	GatewayToken      string // optional bearer token forwarded to pinchtab and required from daemons
+
+	// Networking (per-VM TAP + host NAT).
+	EgressInterface   string // host uplink for NAT MASQUERADE; auto-detected if empty
+	NetworkCIDR       string // base address space; default "172.16.0.0/16"
+	DisableNetworking bool   // skip TAP setup (vsock-only VMs)
 }
 
 // applyDefaults fills zero-valued fields with sensible defaults.
@@ -83,6 +88,9 @@ func (c *ManagerConfig) applyDefaults() {
 	}
 	if c.UseSnapshot && c.SnapshotDir == "" {
 		c.SnapshotDir = filepath.Join(os.TempDir(), "ix-golden-snapshot")
+	}
+	if c.NetworkCIDR == "" {
+		c.NetworkCIDR = "172.16.0.0/16"
 	}
 	if c.BrowserMode == "remote" {
 		if c.BrowserVMMemoryMB == 0 {
@@ -167,6 +175,11 @@ func NewManager(ctx context.Context, cfg ManagerConfig) (*IXManager, error) {
 		maxConc = 1
 	}
 
+	// Custom CIDRs are not yet supported (the /30 derivation assumes the /16 base).
+	if cfg.NetworkCIDR != "172.16.0.0/16" {
+		return nil, fmt.Errorf("custom NetworkCIDR %q not yet supported; leave empty for the default", cfg.NetworkCIDR)
+	}
+
 	mCtx, cancel := context.WithCancel(ctx)
 
 	m := &IXManager{
@@ -176,6 +189,8 @@ func NewManager(ctx context.Context, cfg ManagerConfig) (*IXManager, error) {
 			kernelPath:  cfg.KernelPath,
 			rootfsImage: cfg.RootfsImage,
 			logger:      cfg.Logger,
+			tapAlloc:    newTapAllocator(0),
+			disableNet:  cfg.DisableNetworking,
 		},
 		sandboxes: make(map[string]*IXSandbox),
 		semaphore: make(chan struct{}, maxConc),
@@ -185,6 +200,33 @@ func NewManager(ctx context.Context, cfg ManagerConfig) (*IXManager, error) {
 		poolStop:  make(chan struct{}),
 	}
 	m.accepting.Store(true)
+
+	if !cfg.DisableNetworking {
+		egress := cfg.EgressInterface
+		if egress == "" {
+			detected, err := detectEgressInterface(mCtx)
+			if err != nil {
+				cancel()
+				return nil, fmt.Errorf("detect egress interface (set EgressInterface to override): %w", err)
+			}
+			egress = detected
+		}
+		if err := ensureHostNAT(mCtx, cfg.NetworkCIDR, egress); err != nil {
+			cancel()
+			return nil, fmt.Errorf("ensure host NAT: %w", err)
+		}
+		if cfg.BrowserMode == "remote" {
+			gwIP, err := parseGatewayIP(cfg.GatewayListenAddr)
+			if err != nil {
+				cancel()
+				return nil, fmt.Errorf("parse gateway addr: %w", err)
+			}
+			if err := ensureGatewayAddr(mCtx, gwIP); err != nil {
+				cancel()
+				return nil, fmt.Errorf("ensure gateway addr: %w", err)
+			}
+		}
+	}
 
 	if cfg.BrowserMode == "remote" {
 		tier, gwURL, err := startBrowserTier(mCtx, m.vmm, cfg)
@@ -426,6 +468,16 @@ func (m *IXManager) Close() error {
 	}
 
 	m.tier.stop(m.vmm)
+
+	// One manager owns the host's networking. The ix-nat table and ip_forward
+	// are host-wide and idempotent, so they are left in place; only the gateway
+	// dummy interface (browser-remote only) is removed here. Running multiple
+	// managers on one host is not supported (tap names and ixgw0 are global).
+	if m.cfg.BrowserMode == "remote" && !m.cfg.DisableNetworking {
+		if err := teardownGatewayAddr(context.Background()); err != nil {
+			m.logger.Warn("teardown gateway addr", "error", err)
+		}
+	}
 
 	return firstErr
 }

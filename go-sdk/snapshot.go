@@ -85,7 +85,7 @@ func (sm *SnapshotManager) CreateGolden(ctx context.Context) error {
 
 	sm.logger.Info("snapshot: booting golden VM")
 
-	handle, err := sm.backend.startVMCold(ctx, "golden-tmp", sm.vcpus, sm.memMB, sm.rootfsImage, nil, nil)
+	handle, err := sm.backend.startVMCold(ctx, "golden-tmp", sm.vcpus, sm.memMB, sm.rootfsImage, nil, nil, true) // forceNoNet: golden snapshots stay vsock-only (snapshot networking is unsupported).
 	if err != nil {
 		return fmt.Errorf("start golden VM: %w", err)
 	}
@@ -165,8 +165,8 @@ func (sm *SnapshotManager) CreateGolden(ctx context.Context) error {
 // The restored VM's daemon is already running (it was captured post-ready), so
 // Restore only polls /health rather than waiting for a full READY handshake.
 //
-// CID and PasstPID are 0 — snapshot-restored VMs do not use vsock CIDs or
-// passt for networking (those are baked into the snapshot).
+// CID is 0 and Net is nil — snapshot-restored VMs use neither a vsock CID nor
+// a host TAP (networking is baked into the snapshot).
 func (sm *SnapshotManager) Restore(ctx context.Context, sandboxID string) (*VMMHandle, error) {
 	sm.mu.Lock()
 	ready := sm.ready
@@ -251,7 +251,6 @@ func (sm *SnapshotManager) Restore(ctx context.Context, sandboxID string) (*VMMH
 		VsockPath: vsockUDS,
 		APISocket: apiSocket,
 		CID:       0, // not used for snapshot clones
-		PasstPID:  0, // not used for snapshot clones
 	}, nil
 }
 

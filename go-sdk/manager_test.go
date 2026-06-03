@@ -227,3 +227,11 @@ func TestApplyDefaults_BrowserTierMemoryDefault(t *testing.T) {
 		t.Errorf("default browser-tier memory = %d MB, want 4096", cfg.BrowserVMMemoryMB)
 	}
 }
+
+func TestApplyDefaultsNetworkCIDR(t *testing.T) {
+	c := ManagerConfig{}
+	c.applyDefaults()
+	if c.NetworkCIDR != "172.16.0.0/16" {
+		t.Errorf("NetworkCIDR default = %q, want 172.16.0.0/16", c.NetworkCIDR)
+	}
+}

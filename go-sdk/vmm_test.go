@@ -45,7 +45,7 @@ func TestFirecrackerConfigValidation(t *testing.T) {
 
 func TestBuildKernelBootArgs(t *testing.T) {
 	env := []string{"IX_EGRESS_ENABLED=true", "IX_EGRESS_MODE=allow"}
-	args := buildKernelBootArgs(env)
+	args := buildKernelBootArgs(env, nil)
 
 	if args == "" {
 		t.Fatal("expected non-empty boot args")
@@ -67,6 +67,22 @@ func TestBuildKernelBootArgs(t *testing.T) {
 	}
 	if !strings.Contains(args, "ix.env.IX_EGRESS_MODE=allow") {
 		t.Errorf("boot args missing ix.env.IX_EGRESS_MODE=allow: %s", args)
+	}
+}
+
+func TestBuildKernelBootArgsWithNet(t *testing.T) {
+	vn := deriveVMNet(0) // host 172.16.0.1, guest 172.16.0.2
+	args := buildKernelBootArgs(nil, &vn)
+	want := "ip=172.16.0.2::172.16.0.1:255.255.255.252::eth0:off:8.8.8.8"
+	if !strings.Contains(args, want) {
+		t.Errorf("boot args missing %q\n%s", want, args)
+	}
+}
+
+func TestBuildKernelBootArgsNoNet(t *testing.T) {
+	args := buildKernelBootArgs(nil, nil)
+	if strings.Contains(args, "ip=") {
+		t.Errorf("boot args should have no ip= when net is nil: %s", args)
 	}
 }
 
@@ -136,7 +152,7 @@ func TestAllocateCID(t *testing.T) {
 }
 
 func TestBuildKernelBootArgsEmpty(t *testing.T) {
-	args := buildKernelBootArgs(nil)
+	args := buildKernelBootArgs(nil, nil)
 
 	if args == "" {
 		t.Fatal("expected non-empty boot args even with empty env slice")
@@ -168,7 +184,7 @@ func TestBuildKernelBootArgsSpecialChars(t *testing.T) {
 		"MSG=hello world", // value contains space
 		"EMPTY=",          // empty value
 	}
-	args := buildKernelBootArgs(env)
+	args := buildKernelBootArgs(env, nil)
 
 	if !strings.Contains(args, "ix.env.FOO=bar=baz") {
 		t.Errorf("boot args missing ix.env.FOO=bar=baz: %s", args)

@@ -45,6 +45,10 @@ mount -t tmpfs tmpfs /run 2>/dev/null || true
 # which fail (no route to 127.0.0.1) until loopback is up.
 ip link set lo up 2>/dev/null || true
 
+# Seed DNS for Chrome. The kernel ip= arg populates /proc/net/pnp, but Chrome
+# resolves via /etc/resolv.conf, so write it explicitly (belt-and-suspenders).
+echo "nameserver 8.8.8.8" > /etc/resolv.conf 2>/dev/null || true
+
 # ---------------------------------------------------------------------------
 # 1b. Parse kernel cmdline ix.env.* params into the environment.
 #     Firecracker passes host env as `ix.env.KEY=VALUE` on the cmdline; the

@@ -10,7 +10,8 @@ import (
 )
 
 // defaultGatewayListenAddr is the host address the browser-tier Gateway binds
-// by default — a link-local address reachable from guests via passt. Shared by
+// by default — a link-local address reachable from guests via their per-VM TAP
+// route (the manager pins it on the ixgw0 dummy interface). Shared by
 // applyDefaults and gatewayURLFromAddr so the two never silently diverge.
 const defaultGatewayListenAddr = "169.254.0.1:9100"
 
@@ -58,7 +59,7 @@ func startBrowserTier(ctx context.Context, fb *firecrackerBackend, cfg ManagerCo
 		env = append(env, "PINCHTAB_TOKEN="+cfg.GatewayToken)
 	}
 
-	handle, err := fb.startVMCold(ctx, "browser-tier", 2, cfg.BrowserVMMemoryMB, cfg.BrowserVMImage, env, extra)
+	handle, err := fb.startVMCold(ctx, "browser-tier", 2, cfg.BrowserVMMemoryMB, cfg.BrowserVMImage, env, extra, false)
 	if err != nil {
 		return nil, "", fmt.Errorf("boot browser-tier VM: %w", err)
 	}
