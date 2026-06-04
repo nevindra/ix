@@ -21,9 +21,21 @@ All numbers measured with Go integration benchmarks (`benchtime=3x`).
 | v0.3.1 | Firecracker | vsock UDS | 471ms cold | 15ms | 7ms | 15,100ms (Jupyter) | — |
 | v0.4 | Firecracker | vsock UDS | 47ms snapshot | 15ms | 6ms | 15,100ms (Jupyter) | 78ms (no code) |
 | **v0.5** | **Firecracker** | **vsock UDS** | **45ms snapshot** | **12ms** | **8ms** | **17ms (stdin REPL)** | **72ms** |
+| **v0.6** | **Firecracker** | **vsock UDS** | **75ms snapshot** | **30ms** | **19ms** | **26ms** | **131ms** |
 | **Target** | **Firecracker** | **vsock UDS** | **<100ms** | **<3ms** | **<6ms** | **<10ms** | **<25ms** |
 
 **v0.5 notes:** Replaced Jupyter/ZMQ kernel (15s boot) with stdin/stdout REPL (<100ms boot). Python code exec dropped from 15,100ms to 17ms — **888x faster**. REPL survives snapshot/restore because stdin/stdout pipes are kernel-managed IPC. E2E agent cycle with Python: 72ms.
+
+**v0.6 notes:** Security/correctness release, not a perf release — every VM previously
+mounted the SAME rootfs image read-write (fleet-wide ext4 corruption + cross-tenant
+persistence bug). Now: shared read-only rootfs + per-VM sparse scratch disk via a
+whole-root overlayfs (`ix-stage0`). The regression vs v0.5 conflates TWO changes that
+landed in between: per-VM TAP + host NAT networking (v0.5 had no working egress) and
+the disk isolation itself — TAP setup was never benchmarked separately. n=5 runs are
+noisy (±30-80% run-to-run on creation paths); the most reproducible signal is
+FileReadWrite 8→19ms (overlayfs on the /workspace write path). Candidate follow-ups:
+bind-mount the scratch disk directly at /workspace (takes overlayfs out of the agent
+file-ops hot path), journal-less scratch ext4, `benchtime 20x` for stable numbers.
 
 ### v0.5 vs v0.0 — full journey
 
@@ -34,6 +46,50 @@ All numbers measured with Go integration benchmarks (`benchtime=3x`).
 | **File R+W** | 80ms | **8ms** | **10x** |
 | **Code exec (Python)** | 128ms | **17ms** | **7.5x** |
 | **E2E agent cycle** | 753ms | **72ms** | **10.5x** |
+
+### v0.6 — read-only rootfs + per-VM scratch overlay (2026-06-04)
+
+VMM: Firecracker v1.15.1, kernel vmlinux 6.1.155, host kernel 7.0.0-22
+Disk: shared ro rootfs (`is_read_only: true`) + per-VM sparse scratch ext4 (10 GB)
+mounted as a whole-root overlayfs by the `ix-stage0` pre-init
+Networking: per-VM TAP + host nft NAT (masquerade on any non-TAP egress)
+Creation: snapshot restore copies the golden VM's scratch per clone
+
+```
+BenchmarkCreateCold-16             5    611625304 ns/op    182561 B/op    1486 allocs/op
+BenchmarkCreateFromPool-16         5    293006213 ns/op    190016 B/op    1571 allocs/op
+BenchmarkShellEcho-16              5     38901756 ns/op     34776 B/op     227 allocs/op
+BenchmarkCodeExecPython-16         5     30462067 ns/op     24433 B/op     206 allocs/op
+BenchmarkCodeExecFirstCall-16      5    803637476 ns/op    218177 B/op    1625 allocs/op
+BenchmarkFileReadWrite-16          5     19387336 ns/op     42692 B/op     292 allocs/op
+BenchmarkShellPersistent-16        5     30243795 ns/op     29688 B/op     217 allocs/op
+BenchmarkShellOneShot-16           5     37892683 ns/op     32961 B/op     222 allocs/op
+BenchmarkCreatePoolPreWarmed-16    5    369968969 ns/op    350310 B/op    2737 allocs/op
+BenchmarkE2EAgentCycle-16          5    264875729 ns/op    328800 B/op    2844 allocs/op
+BenchmarkEndToEnd-16               5    262790774 ns/op    319161 B/op    2750 allocs/op
+BenchmarkCreateFromSnapshot-16     5     75111280 ns/op     91192 B/op     538 allocs/op
+BenchmarkE2ESnapshotCycle-16       5    130644213 ns/op    132953 B/op     971 allocs/op
+BenchmarkCodeExecSnapshot-16       5     26086306 ns/op     23696 B/op     191 allocs/op
+```
+
+**What this bought:** the previous design mounted one shared `base.ext4` read-write in
+every concurrent VM — guaranteed ext4 corruption under load, cross-chat workspace
+leakage, and writes that persisted into the template all future VMs boot from.
+All three are now structurally impossible and regression-tested
+(`TestRootfsImmutableUnderConcurrentWrites`, `TestWorkspaceIsolation`,
+`TestSnapshotCloneIsolation`).
+
+**Where the new time goes (vs v0.5):**
+
+```
+CreateCold: +~190ms       TAP create + addr + up (3x ip exec) + nft, scratch
+                          template copy (cp --sparse exec), scratch drive PUT,
+                          guest stage0 (mount vdb + overlay + pivot_root)
+CreateFromSnapshot: +30ms golden-scratch copy per clone (cp --sparse exec)
+Shell/File/Code: +8-23ms  every guest path lookup now traverses overlayfs;
+                          /workspace writes hit the overlay upper (copy-up
+                          machinery) instead of raw ext4
+```
 
 ### v0.5 — Firecracker + snapshot + stdin REPL (2026-05-25)
 
