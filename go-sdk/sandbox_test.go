@@ -225,6 +225,20 @@ func ixMux(t *testing.T) *http.ServeMux {
 		})
 	})
 
+	// Browser wait
+	mux.HandleFunc("POST /v1/browser/wait", func(w http.ResponseWriter, r *http.Request) {
+		var req map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req["kind"] != "selector" || req["value"] != "#login" {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"satisfied": true, "kind": "selector", "elapsed_ms": 840,
+		})
+	})
+
 	return mux
 }
 
@@ -429,6 +443,22 @@ func TestIXSandboxBrowserPDF(t *testing.T) {
 	}
 	if string(data) != "%PDF-fake-data" {
 		t.Errorf("got %q, want %q", string(data), "%PDF-fake-data")
+	}
+}
+
+func TestIXSandboxBrowserWait(t *testing.T) {
+	s, _ := newTestSandbox(t)
+
+	res, err := s.BrowserWait(context.Background(), sandbox.BrowserWaitOpts{
+		Kind:      "selector",
+		Value:     "#login",
+		TimeoutMs: 5000,
+	})
+	if err != nil {
+		t.Fatalf("BrowserWait() returned error: %v", err)
+	}
+	if !res.Satisfied || res.Kind != "selector" || res.ElapsedMs != 840 {
+		t.Errorf("unexpected result: %+v", res)
 	}
 }
 

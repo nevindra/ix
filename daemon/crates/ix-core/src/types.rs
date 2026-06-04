@@ -227,6 +227,28 @@ pub struct NavigateResult {
     pub title: String,
 }
 
+// Browser wait — see ix-browser/src/wait.rs for the pinchtab translation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrowserWaitOpts {
+    /// "selector" | "text" | "url" | "load" | "time" | "function"
+    pub kind: String,
+    /// selector / text / URL glob / load state / JS expression; unused for time.
+    pub value: Option<String>,
+    /// Max wait in ms; None uses default (10000), capped at 30000.
+    pub timeout_ms: Option<u64>,
+    /// selector kind only: "visible" (default) or "hidden".
+    pub state: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrowserWaitResult {
+    pub satisfied: bool,
+    pub kind: String,
+    pub elapsed_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
 // MCP
 #[derive(Debug, Deserialize)]
 pub struct McpRequest {

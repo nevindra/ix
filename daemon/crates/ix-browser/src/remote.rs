@@ -3,7 +3,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use ix_core::types::{
     BrowserAction, BrowserFindResult, BrowserResult, BrowserSnapshot, BrowserTextResult,
-    EgressPolicy, NavigateResult, SnapshotOpts, TextOpts,
+    BrowserWaitOpts, BrowserWaitResult, EgressPolicy, NavigateResult, SnapshotOpts, TextOpts,
 };
 use ix_core::{Error, Result};
 
@@ -170,6 +170,27 @@ impl BrowserBackend for RemoteSharedBrowserBackend {
             .await
     }
 
+    async fn wait(&self, opts: BrowserWaitOpts) -> Result<BrowserWaitResult> {
+        let body = crate::wait::build_wait_body(&opts)?;
+        // The shared client has a global 30 s timeout that would fire exactly
+        // at a 30 s wait deadline — give this request its own larger budget.
+        let request_timeout = Duration::from_millis(
+            crate::wait::effective_timeout_ms(&opts) + crate::wait::WAIT_HTTP_MARGIN_MS,
+        );
+        let url = format!("{}/v1/browser/wait", self.gateway_url);
+        let resp = self
+            .apply_headers(self.client.post(&url).timeout(request_timeout).json(&body))
+            .send()
+            .await
+            .map_err(|e| Error::Internal(format!("gateway request failed: {e}")))?;
+        let resp: crate::wait::PinchtabWaitResponse = map_gateway_error(resp)
+            .await?
+            .json()
+            .await
+            .map_err(|e| Error::Internal(format!("failed to parse gateway response: {e}")))?;
+        Ok(crate::wait::to_wait_result(&opts.kind, resp))
+    }
+
     fn available(&self) -> bool {
         true
     }
@@ -303,5 +324,94 @@ mod tests {
             RemoteSharedBrowserBackend::new(server.uri(), "c".into(), &policy(), None);
         let err = backend.navigate("https://example.com").await.unwrap_err();
         assert!(matches!(err, ix_core::Error::Unavailable(_)));
+    }
+
+    #[tokio::test]
+    async fn wait_forwards_translated_body_and_maps_response() {
+        use ix_core::types::BrowserWaitOpts;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/browser/wait"))
+            // The gateway relays bodies verbatim to pinchtab, so the remote
+            // backend must send the PINCHTAB wire format, not the ix one.
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "timeout": 5000,
+                "selector": "#login",
+                "state": "visible"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "waited": true, "elapsed": 840, "match": "#login"
+            })))
+            .mount(&server)
+            .await;
+
+        let backend =
+            RemoteSharedBrowserBackend::new(server.uri(), "c".into(), &policy(), None);
+        let res = backend
+            .wait(BrowserWaitOpts {
+                kind: "selector".to_string(),
+                value: Some("#login".to_string()),
+                timeout_ms: Some(5_000),
+                state: None,
+            })
+            .await
+            .unwrap();
+        assert!(res.satisfied);
+        assert_eq!(res.kind, "selector");
+        assert_eq!(res.elapsed_ms, 840);
+        assert_eq!(res.detail, None);
+    }
+
+    #[tokio::test]
+    async fn wait_timeout_response_is_not_an_error() {
+        use ix_core::types::BrowserWaitOpts;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/browser/wait"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "waited": false, "elapsed": 10000,
+                "error": "timeout after 10000ms waiting for selector"
+            })))
+            .mount(&server)
+            .await;
+
+        let backend =
+            RemoteSharedBrowserBackend::new(server.uri(), "c".into(), &policy(), None);
+        let res = backend
+            .wait(BrowserWaitOpts {
+                kind: "selector".to_string(),
+                value: Some("#never".to_string()),
+                timeout_ms: None,
+                state: None,
+            })
+            .await
+            .unwrap();
+        assert!(!res.satisfied);
+        assert_eq!(
+            res.detail.as_deref(),
+            Some("timeout after 10000ms waiting for selector")
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_unknown_kind_is_bad_request_without_calling_gateway() {
+        use ix_core::types::BrowserWaitOpts;
+        // Port 1 is never listening — proves validation short-circuits locally.
+        let backend = RemoteSharedBrowserBackend::new(
+            "http://127.0.0.1:1".to_string(),
+            "c".into(),
+            &policy(),
+            None,
+        );
+        let err = backend
+            .wait(BrowserWaitOpts {
+                kind: "bogus".to_string(),
+                value: None,
+                timeout_ms: None,
+                state: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ix_core::Error::BadRequest(_)));
     }
 }

@@ -619,6 +619,39 @@ func (s *IXSandbox) BrowserFind(ctx context.Context, query string) (sandbox.Brow
 	return resp, nil
 }
 
+// BrowserWait blocks until a page condition is met or the timeout elapses.
+// A timeout is not an error: the result reports Satisfied=false with Detail.
+func (s *IXSandbox) BrowserWait(ctx context.Context, opts sandbox.BrowserWaitOpts) (sandbox.BrowserWaitResult, error) {
+	if err := s.checkClosed(); err != nil {
+		return sandbox.BrowserWaitResult{}, err
+	}
+	body := map[string]any{"kind": opts.Kind}
+	if opts.Value != "" {
+		body["value"] = opts.Value
+	}
+	if opts.TimeoutMs > 0 {
+		body["timeout_ms"] = opts.TimeoutMs
+	}
+	if opts.State != "" {
+		body["state"] = opts.State
+	}
+	var resp struct {
+		Satisfied bool   `json:"satisfied"`
+		Kind      string `json:"kind"`
+		ElapsedMs int    `json:"elapsed_ms"`
+		Detail    string `json:"detail"`
+	}
+	if err := s.client.post(ctx, "/v1/browser/wait", body, &resp); err != nil {
+		return sandbox.BrowserWaitResult{}, fmt.Errorf("browser wait: %w", err)
+	}
+	return sandbox.BrowserWaitResult{
+		Satisfied: resp.Satisfied,
+		Kind:      resp.Kind,
+		ElapsedMs: resp.ElapsedMs,
+		Detail:    resp.Detail,
+	}, nil
+}
+
 // BrowserText extracts readable text content from the current page.
 func (s *IXSandbox) BrowserText(ctx context.Context, opts sandbox.TextOpts) (sandbox.BrowserTextResult, error) {
 	if err := s.checkClosed(); err != nil {

@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use ix_core::types::{
     BrowserAction, BrowserFindResult, BrowserResult, BrowserSnapshot, BrowserTextResult,
-    NavigateResult, SnapshotOpts, TextOpts,
+    BrowserWaitOpts, BrowserWaitResult, NavigateResult, SnapshotOpts, TextOpts,
 };
 use ix_core::{Error, Result};
 
@@ -54,6 +54,9 @@ impl BrowserBackend for NoopBrowserBackend {
     async fn find(&self, _query: &str) -> Result<BrowserFindResult> {
         unavailable()
     }
+    async fn wait(&self, _opts: BrowserWaitOpts) -> Result<BrowserWaitResult> {
+        unavailable()
+    }
     fn available(&self) -> bool {
         false
     }
@@ -96,5 +99,15 @@ mod tests {
         assert!(matches!(b.pdf().await, Err(Error::Unavailable(_))));
         assert!(matches!(b.eval("1+1").await, Err(Error::Unavailable(_))));
         assert!(matches!(b.find("button").await, Err(Error::Unavailable(_))));
+        assert!(matches!(
+            b.wait(BrowserWaitOpts {
+                kind: "selector".into(),
+                value: Some("#x".into()),
+                timeout_ms: None,
+                state: None,
+            })
+            .await,
+            Err(Error::Unavailable(_))
+        ));
     }
 }

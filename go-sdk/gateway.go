@@ -172,6 +172,7 @@ var browserOps = map[string]browserOp{
 	"pdf":        {method: http.MethodGet, rawBody: true},
 	"evaluate":   {method: http.MethodPost},
 	"find":       {method: http.MethodPost},
+	"wait":       {method: http.MethodPost},
 }
 
 // Handler returns the gateway's HTTP handler.

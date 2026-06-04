@@ -205,6 +205,13 @@ func (m *mockPinchtab) handler() http.Handler {
 		_ = json.NewEncoder(w).Encode(map[string]any{"matches": []string{}})
 	})
 
+	mux.HandleFunc("POST /tabs/{id}/wait", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		m.record(r, string(body))
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]any{"waited": true, "elapsed": 840, "match": "#login"})
+	})
+
 	mux.HandleFunc("POST /tabs/{id}/evaluate", func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		m.record(r, string(body))
@@ -376,6 +383,33 @@ func TestGateway_ActionNavigationChangedBecomesSuccess(t *testing.T) {
 	}
 	if !strings.Contains(out.Message, "navigation") {
 		t.Fatalf("message should describe the navigation, got %q", out.Message)
+	}
+}
+
+// --- wait forwards to the tab-scoped pinchtab route ---
+
+func TestGateway_WaitForwardsToTabScopedRoute(t *testing.T) {
+	g, mock, cleanup := newTestGateway(t)
+	defer cleanup()
+	h := g.Handler()
+
+	rec := doReq(t, h, http.MethodPost, "/v1/browser/wait", "chat1", nil, `{"selector":"#login","state":"visible","timeout":5000}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("wait status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	seq := mock.callSeq()
+	if len(seq) == 0 || seq[len(seq)-1] != "POST /tabs/"+mock.tabID+"/wait" {
+		t.Fatalf("wait should reach pinchtab tab-scoped wait; seq=%v", seq)
+	}
+	var out struct {
+		Waited  bool  `json:"waited"`
+		Elapsed int64 `json:"elapsed"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode body: %v (body=%s)", err, rec.Body.String())
+	}
+	if !out.Waited || out.Elapsed != 840 {
+		t.Fatalf("relayed response wrong: %+v (body=%s)", out, rec.Body.String())
 	}
 }
 

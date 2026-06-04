@@ -4,7 +4,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use ix_core::types::{
     BrowserAction, BrowserFindResult, BrowserResult, BrowserSnapshot, BrowserTextResult,
-    NavigateResult, SnapshotOpts, TextOpts,
+    BrowserWaitOpts, BrowserWaitResult, NavigateResult, SnapshotOpts, TextOpts,
 };
 use ix_core::{Error, Result};
 use tokio::process::Child;
@@ -16,7 +16,7 @@ use crate::backend::BrowserBackend;
 const PINCHTAB_TOKEN: &str = "ix-internal";
 const PINCHTAB_BASE_URL: &str = "http://127.0.0.1:9867";
 const PINCHTAB_CONFIG_PATH: &str = "/tmp/pinchtab/config.json";
-const PINCHTAB_CONFIG: &str = r#"{"server":{"port":"9867","bind":"127.0.0.1","token":"ix-internal"},"instanceDefaults":{"mode":"headless"},"security":{"idpi":{"enabled":false}}}"#;
+const PINCHTAB_CONFIG: &str = r#"{"server":{"port":"9867","bind":"127.0.0.1","token":"ix-internal"},"instanceDefaults":{"mode":"headless"},"security":{"idpi":{"enabled":false},"allowEvaluate":true}}"#;
 
 pub struct PinchtabBackend {
     client: reqwest::Client,
@@ -271,6 +271,7 @@ async fn map_pinchtab_error(resp: reqwest::Response) -> Result<reqwest::Response
 
     Err(match status.as_u16() {
         400 => Error::BadRequest(format!("pinchtab: {body}")),
+        403 => Error::Forbidden(format!("pinchtab: {body}")),
         404 => Error::NotFound(format!("pinchtab: {body}")),
         503 => Error::Unavailable(format!("pinchtab: {body}")),
         _ => Error::Internal(format!("pinchtab HTTP {status}: {body}")),
@@ -321,6 +322,31 @@ impl BrowserBackend for PinchtabBackend {
     async fn find(&self, query: &str) -> Result<BrowserFindResult> {
         self.post_json("/find", &serde_json::json!({ "query": query }))
             .await
+    }
+
+    async fn wait(&self, opts: BrowserWaitOpts) -> Result<BrowserWaitResult> {
+        let body = crate::wait::build_wait_body(&opts)?;
+        // The shared client has a global 30 s timeout that would fire exactly
+        // at a 30 s wait deadline — give this request its own larger budget.
+        let request_timeout = Duration::from_millis(
+            crate::wait::effective_timeout_ms(&opts) + crate::wait::WAIT_HTTP_MARGIN_MS,
+        );
+        let url = format!("{}/wait", self.base_url);
+        let resp = self
+            .client
+            .post(&url)
+            .timeout(request_timeout)
+            .header("Authorization", self.auth_header())
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| Error::Internal(format!("pinchtab request failed: {e}")))?;
+        let resp: crate::wait::PinchtabWaitResponse = map_pinchtab_error(resp)
+            .await?
+            .json()
+            .await
+            .map_err(|e| Error::Internal(format!("failed to parse pinchtab response: {e}")))?;
+        Ok(crate::wait::to_wait_result(&opts.kind, resp))
     }
 
     fn available(&self) -> bool {
@@ -423,6 +449,13 @@ mod tests {
             v["security"]["idpi"]["enabled"],
             serde_json::Value::Bool(false),
             "security.idpi.enabled must be false"
+        );
+        assert_eq!(
+            v["security"]["allowEvaluate"],
+            serde_json::Value::Bool(true),
+            "security.allowEvaluate must be true — pinchtab gates /evaluate and \
+             wait kind=function behind it (default false), which 403s browser_eval \
+             in local mode. browser-vm-init.sh already sets it for the remote tier."
         );
     }
 

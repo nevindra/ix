@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use ix_core::types::{
     BrowserAction, BrowserFindResult, BrowserResult, BrowserSnapshot, BrowserTextResult,
-    NavigateResult, SnapshotOpts, TextOpts,
+    BrowserWaitOpts, BrowserWaitResult, NavigateResult, SnapshotOpts, TextOpts,
 };
 use ix_core::Result;
 
@@ -15,6 +15,9 @@ pub trait BrowserBackend: Send + Sync {
     async fn pdf(&self) -> Result<Vec<u8>>;
     async fn eval(&self, expr: &str) -> Result<String>;
     async fn find(&self, query: &str) -> Result<BrowserFindResult>;
+    /// Block until a page condition is met or the deadline elapses. A timeout
+    /// is NOT an error: the result has `satisfied: false` plus a detail.
+    async fn wait(&self, opts: BrowserWaitOpts) -> Result<BrowserWaitResult>;
     fn available(&self) -> bool;
 }
 
@@ -24,7 +27,7 @@ pub mod mock {
     use async_trait::async_trait;
     use ix_core::types::{
         BrowserAction, BrowserFindResult, BrowserResult, BrowserSnapshot, BrowserTextResult,
-        NavigateResult, SnapshotNode, SnapshotOpts, TextOpts,
+        BrowserWaitOpts, BrowserWaitResult, NavigateResult, SnapshotNode, SnapshotOpts, TextOpts,
     };
     use ix_core::{Error, Result};
 
@@ -43,6 +46,7 @@ pub mod mock {
         pub pdf_response: Option<Vec<u8>>,
         pub eval_response: Option<String>,
         pub find_response: Option<BrowserFindResult>,
+        pub wait_response: Option<BrowserWaitResult>,
     }
 
     impl Default for MockBrowser {
@@ -57,6 +61,7 @@ pub mod mock {
                 pdf_response: None,
                 eval_response: None,
                 find_response: None,
+                wait_response: None,
             }
         }
     }
@@ -156,6 +161,12 @@ pub mod mock {
             self.find_response
                 .clone()
                 .ok_or_else(|| Error::Internal("MockBrowser: find not configured".into()))
+        }
+
+        async fn wait(&self, _opts: BrowserWaitOpts) -> Result<BrowserWaitResult> {
+            self.wait_response
+                .clone()
+                .ok_or_else(|| Error::Internal("MockBrowser: wait not configured".into()))
         }
 
         fn available(&self) -> bool {
@@ -259,5 +270,43 @@ mod tests {
     async fn mock_find_unconfigured_returns_error() {
         let mock = MockBrowser::new();
         assert!(mock.find("submit button").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn mock_wait_returns_configured_value() {
+        use ix_core::types::{BrowserWaitOpts, BrowserWaitResult};
+        let mut mock = MockBrowser::new();
+        mock.wait_response = Some(BrowserWaitResult {
+            satisfied: true,
+            kind: "selector".to_string(),
+            elapsed_ms: 840,
+            detail: None,
+        });
+        let result = mock
+            .wait(BrowserWaitOpts {
+                kind: "selector".to_string(),
+                value: Some("#login".to_string()),
+                timeout_ms: None,
+                state: None,
+            })
+            .await
+            .unwrap();
+        assert!(result.satisfied);
+        assert_eq!(result.elapsed_ms, 840);
+    }
+
+    #[tokio::test]
+    async fn mock_wait_unconfigured_returns_error() {
+        use ix_core::types::BrowserWaitOpts;
+        let mock = MockBrowser::new();
+        assert!(mock
+            .wait(BrowserWaitOpts {
+                kind: "load".to_string(),
+                value: None,
+                timeout_ms: None,
+                state: None,
+            })
+            .await
+            .is_err());
     }
 }

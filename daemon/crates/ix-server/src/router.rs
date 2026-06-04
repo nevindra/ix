@@ -58,6 +58,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1/browser/pdf", get(routes::browser::pdf))
         .route("/v1/browser/evaluate", post(routes::browser::evaluate))
         .route("/v1/browser/find", post(routes::browser::find))
+        .route("/v1/browser/wait", post(routes::browser::wait))
         .route("/v1/http/fetch", post(routes::fetch::http_fetch))
         .route("/v1/web/search", post(routes::fetch::web_search))
         .route(

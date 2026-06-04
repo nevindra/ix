@@ -11,7 +11,7 @@ use http_body_util::BodyExt;
 use ix_browser::BrowserBackend;
 use ix_core::types::{
     BrowserAction, BrowserFindResult, BrowserResult, BrowserSnapshot, BrowserTextResult,
-    NavigateResult, SnapshotOpts, TextOpts,
+    BrowserWaitOpts, BrowserWaitResult, NavigateResult, SnapshotOpts, TextOpts,
 };
 use ix_core::Result;
 use ix_server::router::build_router;
@@ -51,12 +51,65 @@ impl BrowserBackend for MockBrowser {
     async fn find(&self, _query: &str) -> Result<BrowserFindResult> {
         Err(ix_core::Error::Unavailable("mock".into()))
     }
+    async fn wait(&self, _opts: BrowserWaitOpts) -> Result<BrowserWaitResult> {
+        Err(ix_core::Error::Unavailable("mock".into()))
+    }
+}
+
+/// Browser mock that records the last action kind and succeeds on action/wait.
+/// Used for happy-path browser route tests (MockBrowser above is all-503).
+#[derive(Default)]
+struct RecordingBrowser {
+    last_action: std::sync::Mutex<Option<String>>,
+}
+
+#[async_trait]
+impl BrowserBackend for RecordingBrowser {
+    fn available(&self) -> bool {
+        true
+    }
+    async fn navigate(&self, _url: &str) -> Result<NavigateResult> {
+        Err(ix_core::Error::Unavailable("mock".into()))
+    }
+    async fn screenshot(&self) -> Result<Vec<u8>> {
+        Err(ix_core::Error::Unavailable("mock".into()))
+    }
+    async fn action(&self, action: BrowserAction) -> Result<BrowserResult> {
+        *self.last_action.lock().unwrap() = Some(action.action_type.clone());
+        Ok(BrowserResult { success: true, message: None })
+    }
+    async fn snapshot(&self, _opts: SnapshotOpts) -> Result<BrowserSnapshot> {
+        Err(ix_core::Error::Unavailable("mock".into()))
+    }
+    async fn text(&self, _opts: TextOpts) -> Result<BrowserTextResult> {
+        Err(ix_core::Error::Unavailable("mock".into()))
+    }
+    async fn pdf(&self) -> Result<Vec<u8>> {
+        Err(ix_core::Error::Unavailable("mock".into()))
+    }
+    async fn eval(&self, _expr: &str) -> Result<String> {
+        Err(ix_core::Error::Unavailable("mock".into()))
+    }
+    async fn find(&self, _query: &str) -> Result<BrowserFindResult> {
+        Err(ix_core::Error::Unavailable("mock".into()))
+    }
+    async fn wait(&self, opts: BrowserWaitOpts) -> Result<BrowserWaitResult> {
+        Ok(BrowserWaitResult {
+            satisfied: true,
+            kind: opts.kind,
+            elapsed_ms: 42,
+            detail: None,
+        })
+    }
 }
 
 // ─── Test helpers ──────────────────────────────────────────────────────────────
 
-/// Build a test AppState with the given workspace directory.
-fn make_state(workspace: &str) -> Arc<AppState> {
+/// Build a test AppState with the given workspace directory and browser backend.
+fn make_state_with_browser(
+    workspace: &str,
+    browser: Arc<dyn BrowserBackend>,
+) -> Arc<AppState> {
     let config = ix_core::config::DaemonConfig {
         addr: "127.0.0.1:0".to_string(),
         workspace: workspace.to_string(),
@@ -69,11 +122,16 @@ fn make_state(workspace: &str) -> Arc<AppState> {
     };
     Arc::new(AppState {
         config,
-        browser: Arc::new(MockBrowser),
+        browser,
         kernels: Arc::new(ix_code::KernelManager::new()),
         egress: None,
         start_time: std::time::Instant::now(),
     })
+}
+
+/// Build a test AppState with the given workspace directory.
+fn make_state(workspace: &str) -> Arc<AppState> {
+    make_state_with_browser(workspace, Arc::new(MockBrowser))
 }
 
 /// Drain the response body into bytes.
@@ -754,4 +812,71 @@ async fn browser_find_returns_503_when_unavailable() {
         Some(serde_json::json!({ "query": "submit button" })),
     )
     .await;
+}
+
+// ─── Browser wait route ────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn browser_wait_unavailable_returns_503() {
+    let state = make_state("/tmp");
+    let app = build_router(state);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/browser/wait")
+                .header("content-type", "application/json")
+                .body(Body::from(r##"{"kind":"selector","value":"#x"}"##))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn browser_action_kind_key_is_translated_to_press() {
+    let rec = Arc::new(RecordingBrowser::default());
+    let state = make_state_with_browser("/tmp", rec.clone());
+    let app = build_router(state);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/browser/action")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"kind":"key","key":"Enter"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(rec.last_action.lock().unwrap().as_deref(), Some("press"));
+}
+
+#[tokio::test]
+async fn browser_wait_returns_structured_result() {
+    let state = make_state_with_browser("/tmp", Arc::new(RecordingBrowser::default()));
+    let app = build_router(state);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/browser/wait")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r##"{"kind":"selector","value":"#login","timeout_ms":5000}"##,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp.into_body()).await;
+    assert_eq!(json["satisfied"], true);
+    assert_eq!(json["kind"], "selector");
+    assert_eq!(json["elapsed_ms"], 42);
 }

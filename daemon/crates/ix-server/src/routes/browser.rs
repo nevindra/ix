@@ -8,7 +8,7 @@ use axum::Json;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use ix_core::types::{BrowserAction, SnapshotOpts, TextOpts};
+use ix_core::types::{BrowserAction, BrowserWaitOpts, SnapshotOpts, TextOpts};
 use ix_core::Result;
 
 use crate::state::AppState;
@@ -44,9 +44,16 @@ pub async fn screenshot(State(state): State<Arc<AppState>>) -> Result<impl IntoR
 
 pub async fn action(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<BrowserAction>,
+    Json(mut req): Json<BrowserAction>,
 ) -> Result<Json<Value>> {
     check_available(&state)?;
+    // oasis's `browser` tool emits kind="key" for key presses, but pinchtab's
+    // action registry only registers "press" (action_registry.go) and fails
+    // with "unknown action: key". Translate here so both the local and remote
+    // backends always send a kind pinchtab accepts.
+    if req.action_type == "key" {
+        req.action_type = "press".to_string();
+    }
     let result = state.browser.action(req).await?;
     Ok(Json(serde_json::to_value(result).unwrap()))
 }
@@ -109,5 +116,14 @@ pub async fn find(
 ) -> Result<Json<Value>> {
     check_available(&state)?;
     let result = state.browser.find(&req.query).await?;
+    Ok(Json(serde_json::to_value(result).unwrap()))
+}
+
+pub async fn wait(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<BrowserWaitOpts>,
+) -> Result<Json<Value>> {
+    check_available(&state)?;
+    let result = state.browser.wait(req).await?;
     Ok(Json(serde_json::to_value(result).unwrap()))
 }
