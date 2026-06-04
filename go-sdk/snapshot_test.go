@@ -43,6 +43,11 @@ func TestSnapshotManagerPaths(t *testing.T) {
 	if got := sm.memPath(); got != wantMem {
 		t.Errorf("memPath: got %q, want %q", got, wantMem)
 	}
+
+	wantScratch := filepath.Join(dir, "scratch.golden.ext4")
+	if got := sm.scratchGoldenPath(); got != wantScratch {
+		t.Errorf("scratchGoldenPath: got %q, want %q", got, wantScratch)
+	}
 }
 
 // TestSnapshotManagerNotReadyByDefault verifies that a freshly constructed
@@ -54,45 +59,26 @@ func TestSnapshotManagerNotReadyByDefault(t *testing.T) {
 	}
 }
 
-// TestCopyRootfs verifies that copyRootfs produces a byte-for-byte copy of the
-// source file.
-func TestCopyRootfs(t *testing.T) {
-	// Create a temp source file with known content.
-	src, err := os.CreateTemp(t.TempDir(), "rootfs-src-*.ext4")
-	if err != nil {
-		t.Fatalf("create src file: %v", err)
-	}
-	defer src.Close()
+// TestSnapshotManagerReadyRequiresGoldenScratch verifies the Ready() stat
+// guard: the ready flag alone is not enough — the preserved golden scratch
+// must exist on disk (protects against stale or partially deleted dirs).
+func TestSnapshotManagerReadyRequiresGoldenScratch(t *testing.T) {
+	dir := t.TempDir()
+	sm := newTestSnapshotManager(dir)
 
-	content := []byte("fake rootfs image content for testing 1234567890")
-	if _, err := src.Write(content); err != nil {
-		t.Fatalf("write src content: %v", err)
-	}
-	src.Close()
+	sm.mu.Lock()
+	sm.ready = true
+	sm.mu.Unlock()
 
-	dst := filepath.Join(t.TempDir(), "rootfs-dst.ext4")
-
-	if err := copyRootfs(src.Name(), dst); err != nil {
-		t.Fatalf("copyRootfs: %v", err)
+	if sm.Ready() {
+		t.Fatal("Ready() must be false while scratch.golden.ext4 is missing")
 	}
 
-	got, err := os.ReadFile(dst)
-	if err != nil {
-		t.Fatalf("read dst file: %v", err)
+	if err := os.WriteFile(sm.scratchGoldenPath(), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
 	}
-
-	if string(got) != string(content) {
-		t.Errorf("dst content mismatch:\n  got:  %q\n  want: %q", got, content)
+	if !sm.Ready() {
+		t.Fatal("Ready() must be true once the ready flag is set and the golden scratch exists")
 	}
 }
 
-// TestCopyRootfsSrcMissing verifies that copyRootfs returns an error when the
-// source file does not exist.
-func TestCopyRootfsSrcMissing(t *testing.T) {
-	src := "/nonexistent/path/that/does/not/exist.ext4"
-	dst := filepath.Join(t.TempDir(), "rootfs-dst.ext4")
-
-	if err := copyRootfs(src, dst); err == nil {
-		t.Fatal("copyRootfs should return an error for a missing source file")
-	}
-}

@@ -53,9 +53,14 @@ type ManagerConfig struct {
 	GatewayToken      string // optional bearer token forwarded to pinchtab and required from daemons
 
 	// Networking (per-VM TAP + host NAT).
-	EgressInterface   string // host uplink for NAT MASQUERADE; auto-detected if empty
+	EgressInterface   string // optional: restrict NAT MASQUERADE to this uplink; empty = masquerade on any non-TAP egress (robust default for multi-homed/VPN hosts)
 	NetworkCIDR       string // base address space; default "172.16.0.0/16"
 	DisableNetworking bool   // skip TAP setup (vsock-only VMs)
+
+	// Per-VM disk isolation. The rootfs is attached read-only and shared;
+	// each VM writes to a private sparse scratch disk (overlay upper layer).
+	RunDir        string // base dir for per-VM runtime dirs (sockets + scratch disks); default: <dir of RootfsImage>/run. Must NOT be on tmpfs.
+	ScratchSizeMB int64  // per-VM scratch disk size in MB (sparse; allocates only what is written); default 10240
 }
 
 // applyDefaults fills zero-valued fields with sensible defaults.
@@ -107,6 +112,15 @@ func (c *ManagerConfig) applyDefaults() {
 			// this is not externally reachable; override via GatewayToken for prod.
 			c.GatewayToken = defaultGatewayToken
 		}
+	}
+	if c.ScratchSizeMB == 0 {
+		c.ScratchSizeMB = 10240
+	}
+	if c.RunDir == "" && c.RootfsImage != "" {
+		// Default next to the rootfs image: that path is operator-managed real
+		// disk. os.TempDir() would risk tmpfs — sparse scratch growth would
+		// silently consume host RAM.
+		c.RunDir = filepath.Join(filepath.Dir(c.RootfsImage), "run")
 	}
 }
 
@@ -167,6 +181,14 @@ func NewManager(ctx context.Context, cfg ManagerConfig) (*IXManager, error) {
 		return nil, fmt.Errorf("firecracker not found in PATH (set FCBinary)")
 	}
 
+	if err := os.MkdirAll(cfg.RunDir, 0o700); err != nil {
+		return nil, fmt.Errorf("create run dir %q: %w", cfg.RunDir, err)
+	}
+	scratchTemplate := filepath.Join(cfg.RunDir, "scratch-template.ext4")
+	if err := ensureScratchTemplate(scratchTemplate, cfg.ScratchSizeMB); err != nil {
+		return nil, fmt.Errorf("scratch template: %w", err)
+	}
+
 	maxConc := cfg.MaxConcurrent
 	if maxConc <= 0 {
 		maxConc = autoDetectMax(cfg.PerSandbox)
@@ -185,12 +207,14 @@ func NewManager(ctx context.Context, cfg ManagerConfig) (*IXManager, error) {
 	m := &IXManager{
 		cfg: cfg,
 		vmm: &firecrackerBackend{
-			fcBinary:    cfg.FCBinary,
-			kernelPath:  cfg.KernelPath,
-			rootfsImage: cfg.RootfsImage,
-			logger:      cfg.Logger,
-			tapAlloc:    newTapAllocator(0),
-			disableNet:  cfg.DisableNetworking,
+			fcBinary:        cfg.FCBinary,
+			kernelPath:      cfg.KernelPath,
+			rootfsImage:     cfg.RootfsImage,
+			logger:          cfg.Logger,
+			tapAlloc:        newTapAllocator(0),
+			disableNet:      cfg.DisableNetworking,
+			runDir:          cfg.RunDir,
+			scratchTemplate: scratchTemplate,
 		},
 		sandboxes: make(map[string]*IXSandbox),
 		semaphore: make(chan struct{}, maxConc),
@@ -210,16 +234,11 @@ func NewManager(ctx context.Context, cfg ManagerConfig) (*IXManager, error) {
 	}
 
 	if !cfg.DisableNetworking {
-		egress := cfg.EgressInterface
-		if egress == "" {
-			detected, err := detectEgressInterface(mCtx)
-			if err != nil {
-				cancel()
-				return nil, fmt.Errorf("detect egress interface (set EgressInterface to override): %w", err)
-			}
-			egress = detected
-		}
-		if err := ensureHostNAT(mCtx, cfg.NetworkCIDR, egress); err != nil {
+		// Empty EgressInterface masquerades on any non-TAP interface (see
+		// nftRuleset) — no uplink detection: pinning NAT to the default-route
+		// interface breaks on multi-homed hosts (split-tunnel VPNs reroute
+		// destinations through a tun the pinned rule never matches).
+		if err := ensureHostNAT(mCtx, cfg.NetworkCIDR, cfg.EgressInterface); err != nil {
 			cancel()
 			return nil, fmt.Errorf("ensure host NAT: %w", err)
 		}

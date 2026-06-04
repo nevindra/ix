@@ -136,6 +136,7 @@ func TestGatewayArgs(t *testing.T) {
 }
 
 func TestNftRuleset(t *testing.T) {
+	// Explicit egress interface: masquerade restricted to that uplink.
 	rs := nftRuleset("172.16.0.0/16", "enp6s0")
 	for _, want := range []string{
 		"add table ip ix-nat",
@@ -150,14 +151,16 @@ func TestNftRuleset(t *testing.T) {
 	}
 }
 
-func TestParseEgressInterface(t *testing.T) {
-	out := "default via 192.168.1.1 dev enp6s0 proto dhcp src 192.168.1.50 metric 100"
-	got, err := parseEgressInterface(out)
-	if err != nil || got != "enp6s0" {
-		t.Fatalf("parseEgressInterface = %q, %v; want enp6s0", got, err)
+func TestNftRulesetAnyEgress(t *testing.T) {
+	// Empty egress interface (the default): masquerade on ANY non-TAP egress,
+	// so multi-homed hosts (split-tunnel VPNs routing some destinations via a
+	// tun device) still NAT VM traffic wherever it leaves.
+	rs := nftRuleset("172.16.0.0/16", "")
+	if !strings.Contains(rs, `ip saddr 172.16.0.0/16 oifname != "ixtap*" masquerade`) {
+		t.Errorf("nftRuleset(\"\") missing any-egress masquerade rule\n%s", rs)
 	}
-	if _, err := parseEgressInterface("blackhole default"); err == nil {
-		t.Error("expected error when no dev present")
+	if strings.Contains(rs, `oifname "" masquerade`) {
+		t.Errorf("nftRuleset(\"\") must not emit an empty oifname match\n%s", rs)
 	}
 }
 

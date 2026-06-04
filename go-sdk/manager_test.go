@@ -235,3 +235,28 @@ func TestApplyDefaultsNetworkCIDR(t *testing.T) {
 		t.Errorf("NetworkCIDR default = %q, want 172.16.0.0/16", c.NetworkCIDR)
 	}
 }
+
+func TestApplyDefaultsScratchAndRunDir(t *testing.T) {
+	cfg := ManagerConfig{RootfsImage: "/opt/ix/rootfs/base.ext4"}
+	cfg.applyDefaults()
+
+	if cfg.ScratchSizeMB != 10240 {
+		t.Errorf("ScratchSizeMB = %d, want 10240", cfg.ScratchSizeMB)
+	}
+	// RunDir defaults next to the rootfs image — NOT os.TempDir(), which is
+	// often tmpfs (scratch disks must live on real disk, not host RAM).
+	if cfg.RunDir != "/opt/ix/rootfs/run" {
+		t.Errorf("RunDir = %q, want /opt/ix/rootfs/run", cfg.RunDir)
+	}
+
+	// Explicit values are preserved.
+	cfg2 := ManagerConfig{
+		RootfsImage:   "/opt/ix/rootfs/base.ext4",
+		RunDir:        "/var/lib/ix/run",
+		ScratchSizeMB: 2048,
+	}
+	cfg2.applyDefaults()
+	if cfg2.RunDir != "/var/lib/ix/run" || cfg2.ScratchSizeMB != 2048 {
+		t.Errorf("explicit values overridden: RunDir=%q ScratchSizeMB=%d", cfg2.RunDir, cfg2.ScratchSizeMB)
+	}
+}

@@ -3,6 +3,8 @@
 package ix
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -51,9 +53,17 @@ func TestBuildKernelBootArgs(t *testing.T) {
 		t.Fatal("expected non-empty boot args")
 	}
 
-	// Must contain init path.
-	if !strings.Contains(args, "init=/sbin/ix-init") {
-		t.Errorf("boot args missing init path: %s", args)
+	// Must contain the stage-0 init path (overlay/pivot pre-init).
+	if !strings.Contains(args, "init=/sbin/ix-stage0") {
+		t.Errorf("boot args missing stage-0 init path: %s", args)
+	}
+
+	// Root must be mounted READ-ONLY: the rootfs image is shared by all VMs.
+	if !strings.Contains(args, " ro ") {
+		t.Errorf("boot args missing ro root flag: %s", args)
+	}
+	if strings.Contains(args, " rw ") {
+		t.Errorf("boot args must not mount root rw: %s", args)
 	}
 
 	// Must contain console spec.
@@ -164,7 +174,7 @@ func TestBuildKernelBootArgsEmpty(t *testing.T) {
 		"reboot=k",
 		"panic=1",
 		"pci=off",
-		"init=/sbin/ix-init",
+		"init=/sbin/ix-stage0",
 	} {
 		if !strings.Contains(args, required) {
 			t.Errorf("boot args missing %q: %s", required, args)
@@ -194,6 +204,21 @@ func TestBuildKernelBootArgsSpecialChars(t *testing.T) {
 	}
 	if !strings.Contains(args, "ix.env.EMPTY=") {
 		t.Errorf("boot args missing ix.env.EMPTY=: %s", args)
+	}
+}
+
+func TestVMDir(t *testing.T) {
+	fb := &firecrackerBackend{runDir: "/var/lib/ix/run"}
+	if got := fb.vmDir("abc123"); got != "/var/lib/ix/run/ix-abc123" {
+		t.Errorf("vmDir = %q, want /var/lib/ix/run/ix-abc123", got)
+	}
+
+	// Empty runDir falls back to os.TempDir() (bare test backends).
+	fb2 := &firecrackerBackend{}
+	got := fb2.vmDir("abc123")
+	want := filepath.Join(os.TempDir(), "ix-abc123")
+	if got != want {
+		t.Errorf("vmDir fallback = %q, want %q", got, want)
 	}
 }
 

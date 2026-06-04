@@ -155,6 +155,38 @@ Firecracker supports VM snapshots: pause a running VM, write its full memory and
 
 `MaxConcurrent` bounds how many VMs can run at once. If `0`, the manager auto-detects a safe limit from host CPU and RAM divided by per-VM resources. When all slots are taken, `Create()` attempts to evict the oldest expired sandbox first, then queues for up to 30 seconds before returning `ErrCapacityFull`.
 
+### Disk model: immutable base + per-VM scratch
+
+Every VM shares a single read-only rootfs image (`base.ext4`, or `browser.ext4`, etc.) mounted at `/dev/vda`. Sharing one image across all VMs saves disk space and prevents writes in one sandbox from corrupting the filesystem seen by another.
+
+Each VM also gets its own private sparse scratch disk (`scratch.ext4`) at `/dev/vdb`, placed under `RunDir` (default: `<dir of RootfsImage>/run/ix-<id>/`). The scratch disk is pre-allocated as a sparse file (default 10 GB; configurable via `ScratchSizeMB`) — it uses only the space actually written.
+
+At boot, a small pre-init binary `/sbin/ix-stage0` runs before `ixd`. It:
+
+1. Mounts `/dev/vdb` (the scratch disk) read-write at `/scratch`.
+2. Builds a whole-root overlayfs: `lowerdir=/`, `upperdir=/scratch/upper`, `workdir=/scratch/work`.
+3. `pivot_root`s into the overlay, so all writes to `/etc`, `/workspace`, pip installs, `__pycache__`, and any other path land transparently on the scratch disk.
+4. Execs the normal per-tier init (`ix-init.sh`), which starts `ixd`.
+
+From `ixd`'s perspective the filesystem looks fully writable — the overlay is transparent.
+
+```
+Host:
+  /opt/ix/rootfs/base.ext4          SHARED, immutable (is_read_only: true)
+  <RunDir>/scratch-template.ext4    empty sparse ext4, made once at manager start
+  <RunDir>/ix-<id>/scratch.ext4     per-VM, sparse ext4, rw (drive "scratch")
+  <RunDir>/ix-<id>/{fc.sock, vsock.uds}
+
+Guest:
+  /dev/vda   root, mounted ro       (boot args: root=/dev/vda ro)
+  /dev/vdb   scratch, mounted rw at /scratch
+  overlayfs: lowerdir=/, upperdir=/scratch/upper, workdir=/scratch/work
+  pivot_root into the overlay; all writes (/etc, /workspace, pip installs,
+  __pycache__) land in the scratch disk
+```
+
+**Snapshots and the scratch disk.** The scratch drive is registered with Firecracker under the relative path `"scratch.ext4"` (resolved against the Firecracker process CWD, which is the per-VM run directory). This means snapshot state files reference a relative path and remain valid when snapshot directories are moved. When `CreateGolden` takes a snapshot it preserves that VM's scratch as `scratch.golden.ext4`; `Restore` copies it for each clone so every restored VM starts from the same clean-but-pre-warmed disk state.
+
 ---
 
 ## 5. Networking and isolation — three layers

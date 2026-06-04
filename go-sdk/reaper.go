@@ -75,7 +75,8 @@ func (m *IXManager) reapDisk(ctx context.Context) {
 	}
 }
 
-// recover scans /tmp for orphaned ix-* socket directories left by a previous
+// recover scans RunDir (current per-VM dirs) and /tmp (leftovers from
+// pre-RunDir versions) for orphaned ix-* socket directories left by a previous
 // manager instance and removes them. VM process recovery is not supported in
 // Phase 1 — we cannot reliably identify which processes belong to us across
 // restarts without a process registry.
@@ -101,26 +102,35 @@ func (m *IXManager) recover(ctx context.Context) error {
 		active[m.tier.vmm.SocketDir] = true
 	}
 
-	tmpDir := os.TempDir()
-	entries, err := os.ReadDir(tmpDir)
-	if err != nil {
-		return nil // non-fatal
+	// Scan RunDir (current per-VM dirs: sockets + scratch disks) and
+	// os.TempDir() (leftovers from versions that predate RunDir).
+	scanDirs := []string{m.cfg.RunDir, os.TempDir()}
+	if scanDirs[0] == scanDirs[1] {
+		scanDirs = scanDirs[:1]
 	}
-
-	for _, entry := range entries {
-		if !entry.IsDir() {
+	for _, dir := range scanDirs {
+		if dir == "" {
 			continue
 		}
-		if !strings.HasPrefix(entry.Name(), "ix-") {
-			continue
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue // non-fatal
 		}
-		fullPath := filepath.Join(tmpDir, entry.Name())
-		if active[fullPath] {
-			continue
-		}
-		m.logger.Info("recover: removing orphaned socket dir", "path", fullPath)
-		if err := os.RemoveAll(fullPath); err != nil {
-			m.logger.Warn("recover: remove failed", "path", fullPath, "error", err)
+		for _, entry := range entries {
+			if !entry.IsDir() {
+				continue
+			}
+			if !strings.HasPrefix(entry.Name(), "ix-") {
+				continue
+			}
+			fullPath := filepath.Join(dir, entry.Name())
+			if active[fullPath] {
+				continue
+			}
+			m.logger.Info("recover: removing orphaned socket dir", "path", fullPath)
+			if err := os.RemoveAll(fullPath); err != nil {
+				m.logger.Warn("recover: remove failed", "path", fullPath, "error", err)
+			}
 		}
 	}
 

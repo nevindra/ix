@@ -89,8 +89,8 @@ func buildKernelBootArgs(envSlice []string, net *vmNet) string {
 		"i8042.nopnp",
 		"i8042.dumbkbd",
 		"root=/dev/vda",
-		"rw",
-		"init=/sbin/ix-init",
+		"ro", // the rootfs is one shared image for all VMs — writes go to the per-VM scratch disk via overlayfs (see ix-stage0)
+		"init=/sbin/ix-stage0",
 	}
 	if net != nil {
 		// ip=<client>:<server>:<gw>:<mask>:<host>:<dev>:<autoconf>:<dns>
@@ -105,13 +105,25 @@ func buildKernelBootArgs(envSlice []string, net *vmNet) string {
 
 // firecrackerBackend implements VM lifecycle management using Firecracker.
 type firecrackerBackend struct {
-	fcBinary    string
-	kernelPath  string
-	rootfsImage string
-	logger      *slog.Logger
-	snapshot    *SnapshotManager // optional; when set, startVM uses snapshot restore
-	tapAlloc    *tapAllocator    // TAP index allocator (set by the manager; nil only in tests that never cold-boot)
-	disableNet  bool             // skip TAP setup entirely (vsock-only VM)
+	fcBinary        string
+	kernelPath      string
+	rootfsImage     string
+	logger          *slog.Logger
+	snapshot        *SnapshotManager // optional; when set, startVM uses snapshot restore
+	tapAlloc        *tapAllocator    // TAP index allocator (set by the manager; nil only in tests that never cold-boot)
+	disableNet      bool             // skip TAP setup entirely (vsock-only VM)
+	runDir          string           // base dir for per-VM dirs (sockets + scratch); empty = os.TempDir()
+	scratchTemplate string           // empty sparse ext4 copied per VM as the scratch drive; empty = no scratch (bare test backends)
+}
+
+// vmDir returns the per-VM runtime directory (Firecracker CWD: API socket,
+// vsock UDS, and the per-VM scratch disk all live here).
+func (fb *firecrackerBackend) vmDir(sandboxID string) string {
+	base := fb.runDir
+	if base == "" {
+		base = os.TempDir()
+	}
+	return filepath.Join(base, "ix-"+sandboxID)
 }
 
 // startVM is the primary VM-creation entry point.  When a SnapshotManager is
@@ -131,7 +143,7 @@ func (fb *firecrackerBackend) startVM(ctx context.Context, sandboxID string, vcp
 // startVMCold launches a Firecracker VM and returns a VMMHandle on success.
 //
 // Sequence:
-//  1. Allocate CID and create socket dir at /tmp/ix-{sandboxID}
+//  1. Allocate CID and create the per-VM dir (runDir/ix-{sandboxID}) with its scratch disk
 //  2. Create a per-VM TAP and wire it via PUT /network-interfaces
 //  3. Start Firecracker process with --api-sock
 //  4. Wait for API socket file to appear (5 s timeout)
@@ -146,9 +158,19 @@ func (fb *firecrackerBackend) startVM(ctx context.Context, sandboxID string, vcp
 func (fb *firecrackerBackend) startVMCold(ctx context.Context, sandboxID string, vcpus int, memMB int64, rootfsImage string, envSlice []string, extraDrives []driveSpec, forceNoNet bool) (*VMMHandle, error) {
 	cid := allocateCID()
 
-	socketDir := filepath.Join(os.TempDir(), "ix-"+sandboxID)
+	socketDir := fb.vmDir(sandboxID)
 	if err := os.MkdirAll(socketDir, 0o700); err != nil {
 		return nil, fmt.Errorf("create socket dir: %w", err)
+	}
+
+	// Per-VM scratch disk: every VM gets a private writable ext4 copied from
+	// the empty template. The rootfs itself is attached read-only below — the
+	// guest writes only to this scratch via overlayfs (ix-stage0).
+	if fb.scratchTemplate != "" {
+		if err := copySparse(fb.scratchTemplate, filepath.Join(socketDir, scratchFileName)); err != nil {
+			_ = os.RemoveAll(socketDir)
+			return nil, fmt.Errorf("create scratch disk: %w", err)
+		}
 	}
 
 	apiSocket := filepath.Join(socketDir, "fc.sock")
@@ -186,7 +208,9 @@ func (fb *firecrackerBackend) startVMCold(ctx context.Context, sandboxID string,
 			if err := teardownTap(context.Background(), *vn); err != nil && fb.logger != nil {
 				fb.logger.Warn("teardown tap (error path)", "tap", vn.tapName, "error", err)
 			}
-			fb.tapAlloc.release(vn.idx)
+			if fb.tapAlloc != nil {
+				fb.tapAlloc.release(vn.idx)
+			}
 		}
 		_ = os.RemoveAll(socketDir)
 	}
@@ -224,14 +248,34 @@ func (fb *firecrackerBackend) startVMCold(ctx context.Context, sandboxID string,
 		return nil, fmt.Errorf("set boot source: %w", err)
 	}
 
+	// The rootfs is one shared image for every VM on this host: it MUST be
+	// read-only at the VMM level. Concurrent rw mounts of one ext4 image from
+	// multiple guest kernels corrupt the filesystem and let one chat's writes
+	// persist into the template all future VMs boot from.
 	if err := fcPut(ctx, apiClient, "/drives/rootfs", map[string]any{
 		"drive_id":       "rootfs",
 		"path_on_host":   rootfsImage,
 		"is_root_device": true,
-		"is_read_only":   false,
+		"is_read_only":   true,
 	}); err != nil {
 		cleanupOnErr(cmd.Process)
 		return nil, fmt.Errorf("set rootfs drive: %w", err)
+	}
+
+	// Per-VM writable scratch (overlay upper layer). Registered with a
+	// RELATIVE path resolved against cmd.Dir (= socketDir), like vsock.uds:
+	// snapshot.state records the relative string, so each restored clone
+	// re-resolves it to its own scratch copy.
+	if fb.scratchTemplate != "" {
+		if err := fcPut(ctx, apiClient, "/drives/scratch", map[string]any{
+			"drive_id":       "scratch",
+			"path_on_host":   scratchFileName,
+			"is_root_device": false,
+			"is_read_only":   false,
+		}); err != nil {
+			cleanupOnErr(cmd.Process)
+			return nil, fmt.Errorf("set scratch drive: %w", err)
+		}
 	}
 
 	for _, d := range extraDrives {

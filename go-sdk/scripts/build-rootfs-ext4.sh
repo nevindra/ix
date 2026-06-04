@@ -100,6 +100,19 @@ INIT_SCRIPT_DONE=1
   echo "✓ ix REPL script installed"
 }
 
+install_stage0() {
+  local temp_dir="$1"
+
+  if [[ ! -f "${SCRIPT_DIR}/ix-stage0.sh" ]]; then
+    echo "Error: ix-stage0.sh not found at ${SCRIPT_DIR}/ix-stage0.sh" >&2
+    return 1
+  fi
+
+  echo "Installing ix-stage0 (ro-rootfs overlay pre-init)..."
+  sudo install -m 755 "${SCRIPT_DIR}/ix-stage0.sh" "${temp_dir}/sbin/ix-stage0"
+  echo "✓ ix-stage0 installed"
+}
+
 install_browser_vm_init() {
   local temp_dir="$1"
   # Prefer the in-repo browser-vm-init over the (possibly stale) copy baked into
@@ -131,6 +144,7 @@ create_directories() {
   sudo mkdir -p "${temp_dir}/workspace"
   sudo mkdir -p "${temp_dir}/sbin"
   sudo mkdir -p "${temp_dir}/usr/local/bin"
+  sudo mkdir -p "${temp_dir}/scratch"
   echo "✓ Directories created"
 }
 
@@ -238,8 +252,9 @@ main() {
 
   # Populate rootfs
   create_directories "$TEMP_ROOTFS"
+  install_stage0 "$TEMP_ROOTFS"
   if [[ "$TIER" == "browser-vm" ]]; then
-    echo "browser-vm tier: skipping ixd + ix-init (PID 1 is browser-vm-init from the image)"
+    echo "browser-vm tier: skipping ixd + ix-init (init is browser-vm-init via ix-stage0)"
     install_browser_vm_init "$TEMP_ROOTFS"
   else
     copy_daemon_binary "$TEMP_ROOTFS"

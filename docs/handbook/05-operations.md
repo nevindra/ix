@@ -321,7 +321,58 @@ rm -rf /tmp/ix-golden-snapshot
 
 ---
 
-## 5. Day-2 operations
+## 5. Upgrading to rootfs isolation (immutable base + per-VM scratch)
+
+This section applies when deploying the version that introduced `ix-stage0` — the whole-root overlayfs pre-init that gives each VM a private scratch disk while sharing a single read-only rootfs image. If you are doing a fresh install you can skip it; if you are upgrading an existing deployment, read this carefully.
+
+### What changed
+
+Previously every VM mounted the shared rootfs image read-write. Now:
+
+- The rootfs image is attached **read-only** at the Firecracker level (`is_read_only: true`).
+- Each VM gets a private sparse scratch disk (`scratch.ext4`) under `RunDir`.
+- `/sbin/ix-stage0` (a new pre-init binary baked into the rootfs) builds a whole-root overlayfs at boot and `pivot_root`s into it before `ixd` starts.
+
+### Required steps before running the new version
+
+**1. Rebuild all rootfs images.** `ix-stage0` and the `/scratch` mountpoint directory must be baked into the ext4 image. A rootfs built without them will fail to boot.
+
+```bash
+# Rebuild every tier you use
+cd daemon
+cargo build --release --target x86_64-unknown-linux-musl -p ix-server
+
+cd ..
+cd go-sdk
+./scripts/build-rootfs-ext4.sh base
+./scripts/build-rootfs-ext4.sh browser          # if you use the browser tier
+./scripts/build-rootfs-ext4.sh browser-vm       # if you use the shared browser tier
+```
+
+**2. Delete stale golden snapshots.** An old snapshot has the rootfs in read-write mode frozen into its state. Loading it with the new code causes corruption or a boot failure. Delete the snapshot directory before starting the new version — `NewManager` will recreate it automatically.
+
+```bash
+rm -rf /tmp/ix-golden-snapshot      # or wherever SnapshotDir points in your config
+```
+
+**3. Verify the guest kernel has overlayfs support.** `ix-stage0` uses `mount --type overlay`. The kernel must have `CONFIG_OVERLAY_FS=y` built-in (not as a module — the pre-init runs before the real rootfs is mounted, so modules are unavailable). The kernel shipped by `install-firecracker.sh` already satisfies this; check only if you use a custom kernel.
+
+```bash
+grep CONFIG_OVERLAY_FS /path/to/your/vmlinux.config   # should show =y
+```
+
+### Configuration knobs
+
+| Key | Default | Notes |
+|---|---|---|
+| `RunDir` | `<dir of RootfsImage>/run` | Where per-VM run directories (and scratch disks) are created. **Must not be on tmpfs** — the scratch disk needs to persist across the pivot_root; a tmpfs RunDir silently loses all writes after a reboot of the host. |
+| `ScratchSizeMB` | `10240` (10 GB) | Size of each VM's sparse scratch disk. Sparse — the disk image only consumes space proportional to what the guest actually writes, not the full 10 GB up front. Acts as the per-sandbox disk quota. |
+
+> **`RunDir` must not be on tmpfs.** The scratch ext4 images are per-VM persistent state; placing them on a tmpfs would make every write in the guest vanish on host reboot and would also prevent the overlayfs from functioning correctly. The default (`<rootfs dir>/run`) uses the same filesystem as the rootfs image, which is always a real block device or regular directory.
+
+---
+
+## 6. Day-2 operations
 
 ### Background goroutines and their intervals
 
@@ -357,7 +408,7 @@ When a pool VM is claimed (`mgr.Create()` grabs it), the manager immediately lau
 
 ---
 
-## 6. Troubleshooting
+## 7. Troubleshooting
 
 | Symptom | Likely cause | What to check |
 |---|---|---|
@@ -375,6 +426,9 @@ When a pool VM is claimed (`mgr.Create()` grabs it), the manager immediately lau
 | Snapshots seem to use old daemon | Golden snapshot not regenerated after rootfs rebuild | Delete `SnapshotDir` (default `/tmp/ix-golden-snapshot`) and restart your app so `NewManager` creates a fresh snapshot |
 | "custom NetworkCIDR not yet supported" on startup | Custom `NetworkCIDR` was set | Leave `NetworkCIDR` empty to use the default `172.16.0.0/16` |
 | Gateway listen fails "address already in use" | Another process (or a previous manager) is using `169.254.0.1:9100` | Check `ss -tlnp | grep 9100`; change `GatewayListenAddr` in config |
+| VM panics at boot with "overlay: missing 'lowerdir'" or hangs in `ix-stage0` | Rootfs built without `ix-stage0` or `/scratch` directory | Rebuild the rootfs image (`build-rootfs-ext4.sh`); verify `/sbin/ix-stage0` and `/scratch` exist in the ext4 |
+| VM panics with "unknown filesystem type 'overlay'" | Guest kernel built without `CONFIG_OVERLAY_FS=y` | Use the kernel from `install-firecracker.sh`, or rebuild your custom kernel with overlayfs built in (not as a module) |
+| Disk writes inside VM vanish after host reboot | `RunDir` is on a tmpfs | Set `RunDir` to a persistent filesystem path (default is the same directory as the rootfs image) |
 
 ---
 

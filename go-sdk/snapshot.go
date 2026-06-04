@@ -65,12 +65,26 @@ func (sm *SnapshotManager) memPath() string {
 	return filepath.Join(sm.snapshotDir, "snapshot.mem")
 }
 
+// scratchGoldenPath returns the path of the golden VM's preserved scratch
+// disk. Every restored clone boots from a copy of this file: the clone's
+// guest kernel resumes with in-memory ext4 state (journal position, page
+// cache) that must byte-match the backing file as it was at pause time.
+func (sm *SnapshotManager) scratchGoldenPath() string {
+	return filepath.Join(sm.snapshotDir, "scratch.golden.ext4")
+}
+
 // Ready returns true if a golden snapshot exists and is ready to clone from.
 // It is safe to call from multiple goroutines.
 func (sm *SnapshotManager) Ready() bool {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
-	return sm.ready
+	if !sm.ready {
+		return false
+	}
+	// The golden scratch is required to clone; guard against a snapshot dir
+	// that was created by an older version or partially deleted.
+	_, err := os.Stat(sm.scratchGoldenPath())
+	return err == nil
 }
 
 // CreateGolden boots a "golden" VM, waits for its daemon to be ready, takes a
@@ -79,6 +93,13 @@ func (sm *SnapshotManager) Ready() bool {
 // On success, Ready() returns true and subsequent calls to Restore() will load
 // this snapshot instead of cold-booting.
 func (sm *SnapshotManager) CreateGolden(ctx context.Context) error {
+	// A backend without a scratch template would boot a golden VM without a
+	// scratch disk; the preserve step below would then fail with an opaque cp
+	// error. Fail fast with a clear diagnostic instead.
+	if sm.backend.scratchTemplate == "" {
+		return fmt.Errorf("snapshot: backend has no scratch template configured")
+	}
+
 	if err := os.MkdirAll(sm.snapshotDir, 0o700); err != nil {
 		return fmt.Errorf("create snapshot dir: %w", err)
 	}
@@ -148,6 +169,14 @@ func (sm *SnapshotManager) CreateGolden(ctx context.Context) error {
 		return fmt.Errorf("create snapshot: %w", err)
 	}
 
+	// Preserve the golden VM's scratch disk. Block IO is drained by
+	// Firecracker during /snapshot/create (not merely on pause), so this copy
+	// MUST stay after that call. Restore copies this per clone — see
+	// scratchGoldenPath.
+	if err := copySparse(filepath.Join(handle.SocketDir, scratchFileName), sm.scratchGoldenPath()); err != nil {
+		return fmt.Errorf("preserve golden scratch: %w", err)
+	}
+
 	sm.logger.Info("snapshot: golden snapshot created successfully")
 
 	// cleanup() is called via defer above; mark ready while still holding
@@ -176,16 +205,20 @@ func (sm *SnapshotManager) Restore(ctx context.Context, sandboxID string) (*VMMH
 		return nil, fmt.Errorf("snapshot not ready: call CreateGolden first")
 	}
 
-	socketDir := filepath.Join(os.TempDir(), "ix-"+sandboxID)
+	socketDir := sm.backend.vmDir(sandboxID)
 	if err := os.MkdirAll(socketDir, 0o700); err != nil {
 		return nil, fmt.Errorf("create socket dir: %w", err)
 	}
 
-	// Skip rootfs copy — all clones share the base image. Firecracker reopens
-	// the same path_on_host from the snapshot. The VM uses overlayfs or tmpfs
-	// for writes internally, so the base image stays clean.
-	// TODO: if rootfs corruption is observed, re-enable copyRootfs or use
-	// device-mapper thin snapshots.
+	// The rootfs is shared by all clones and attached read-only at the VMM
+	// level; guests write to their private scratch disk via overlayfs. Give
+	// this clone its own scratch: a byte-identical copy of the golden VM's
+	// scratch at pause time, at the relative path recorded in snapshot.state
+	// (Firecracker re-resolves "scratch.ext4" against this process's cwd).
+	if err := copySparse(sm.scratchGoldenPath(), filepath.Join(socketDir, scratchFileName)); err != nil {
+		_ = os.RemoveAll(socketDir)
+		return nil, fmt.Errorf("create clone scratch: %w", err)
+	}
 
 	apiSocket := filepath.Join(socketDir, "fc.sock")
 	vsockUDS := filepath.Join(socketDir, "vsock.uds")
@@ -296,16 +329,6 @@ func waitHealthyAuth(ctx context.Context, httpClient *http.Client, bearer string
 			}
 		}
 	}
-}
-
-// copyRootfs copies src to dst using cp with --reflink=auto and --sparse=always
-// for efficient copy-on-write on supported filesystems.
-func copyRootfs(src, dst string) error {
-	cmd := exec.Command("cp", "--reflink=auto", "--sparse=always", src, dst)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("cp rootfs %s → %s: %w: %s", src, dst, err, out)
-	}
-	return nil
 }
 
 // fcPatch sends a JSON PATCH request to the Firecracker API and checks the status.

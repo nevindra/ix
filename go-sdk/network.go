@@ -145,27 +145,27 @@ func gwAddrArgs(iface, ip string) []string {
 // nftRuleset returns an idempotent nft script for the ix-nat table: create the
 // table (no-op if present), flush it, then re-add the masquerade + forward
 // rules. Loaded via `nft -f -`.
+//
+// An empty egressIface masquerades VM traffic leaving on ANY non-TAP interface
+// (the Docker pattern: `-s <cidr> ! -o docker0 -j MASQUERADE`). Pinning NAT to
+// one detected uplink breaks on multi-homed hosts: a split-tunnel VPN that
+// routes specific destinations through its tun sends VM packets out that tun
+// unmatched and un-NATed, and the far end drops them (observed with 8.8.8.8
+// rerouted via a corporate VPN). A non-empty egressIface restricts the
+// masquerade to that uplink for operators who want the pinning.
 func nftRuleset(cidr, egressIface string) string {
+	masq := fmt.Sprintf(`ip saddr %s oifname != "ixtap*" masquerade`, cidr)
+	if egressIface != "" {
+		masq = fmt.Sprintf(`ip saddr %s oifname "%s" masquerade`, cidr, egressIface)
+	}
 	return fmt.Sprintf(`add table ip ix-nat
 flush table ip ix-nat
 add chain ip ix-nat postrouting { type nat hook postrouting priority 100 ; }
-add rule ip ix-nat postrouting ip saddr %s oifname "%s" masquerade
+add rule ip ix-nat postrouting %s
 add chain ip ix-nat forward { type filter hook forward priority 0 ; }
 add rule ip ix-nat forward iifname "ixtap*" accept
 add rule ip ix-nat forward oifname "ixtap*" accept
-`, cidr, egressIface)
-}
-
-// parseEgressInterface extracts the first `dev <iface>` from `ip route show
-// default` output.
-func parseEgressInterface(routeOutput string) (string, error) {
-	fields := strings.Fields(routeOutput)
-	for i, f := range fields {
-		if f == "dev" && i+1 < len(fields) {
-			return fields[i+1], nil
-		}
-	}
-	return "", fmt.Errorf("no default-route interface in %q", routeOutput)
+`, masq)
 }
 
 // parseGatewayIP returns the host portion of a host:port listen address, e.g.
@@ -318,15 +318,6 @@ func teardownForwardAccept(ctx context.Context) {
 	for _, dir := range []string{"-i", "-o"} {
 		_ = exec.CommandContext(ctx, "iptables", append([]string{"-D"}, forwardRule(chain, dir)...)...).Run()
 	}
-}
-
-// detectEgressInterface returns the interface of the default route.
-func detectEgressInterface(ctx context.Context) (string, error) {
-	out, err := exec.CommandContext(ctx, "ip", "route", "show", "default").CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("ip route show default: %w: %s", err, out)
-	}
-	return parseEgressInterface(string(out))
 }
 
 // gatewayDummyIface is the host dummy interface that owns the Gateway IP.

@@ -77,7 +77,7 @@ ix-server (binary: ixd)
 
 - **`IXManager`** — pool-based lifecycle manager. Pre-warms VMs in a pool, auto-detects concurrency from host CPU/RAM, runs background goroutines for monitoring (10s), reaping (30s TTL + disk pressure), and pool replenishment.
 - **`IXSandbox`** — pure HTTP proxy. Every method (Shell, ExecCode, ReadFile, BrowserNavigate, etc.) is a POST to the daemon's REST API. Streaming uses SSE with context-aware cancellation.
-- **VMM layer** — Firecracker backend: allocates vsock CID, creates a per-VM TAP device (host NAT via `nft` for outbound traffic), configures VM via Firecracker API (PUT boot source, rootfs, machine config, network-interface, vsock), fires `InstanceStart`. Env vars pass via kernel boot args.
+- **VMM layer** — Firecracker backend: allocates vsock CID, creates a per-VM TAP device (host NAT via `nft` for outbound traffic), configures VM via Firecracker API (PUT boot source, read-only rootfs + per-VM scratch disk, machine config, network-interface, vsock), fires `InstanceStart`. Env vars pass via kernel boot args. The rootfs is shared read-only across all VMs; each VM writes through a whole-root overlayfs onto a private sparse scratch disk (`ix-stage0`).
 - **Snapshot/restore** — `CreateGolden` boots a temp VM, pre-warms Python kernel, pauses, writes a full snapshot. Restore loads snapshot and polls `/health` (no READY handshake needed since daemon was already running).
 - **Vsock transport** — custom `http.Transport` that dials the vsock UDS, sends `CONNECT 1024\n`, reads `OK <port>\n`, then uses the connection as TCP to the daemon.
 
