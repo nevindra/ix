@@ -44,7 +44,7 @@ go test -tags=integration ./...
 ### Docker image
 
 ```bash
-docker build -f daemon/cmd/Dockerfile daemon/  # builds multi-stage (base → browser → full)
+docker build -f daemon/cmd/Dockerfile daemon/  # builds multi-stage (base → browser, plus standalone browser-vm)
 docker run --shm-size=2g -p 8080:8080 <image>  # Chrome needs --shm-size=2g
 ```
 
@@ -77,14 +77,14 @@ ix-server (binary: ixd)
 
 - **`IXManager`** — pool-based lifecycle manager. Pre-warms VMs in a pool, auto-detects concurrency from host CPU/RAM, runs background goroutines for monitoring (10s), reaping (30s TTL + disk pressure), and pool replenishment.
 - **`IXSandbox`** — pure HTTP proxy. Every method (Shell, ExecCode, ReadFile, BrowserNavigate, etc.) is a POST to the daemon's REST API. Streaming uses SSE with context-aware cancellation.
-- **VMM layer** — Firecracker backend: allocates vsock CID, launches `passt` for user-mode networking, configures VM via Firecracker API (PUT boot source, rootfs, machine config, vsock), fires `InstanceStart`. Env vars pass via kernel boot args.
+- **VMM layer** — Firecracker backend: allocates vsock CID, creates a per-VM TAP device (host NAT via `nft` for outbound traffic), configures VM via Firecracker API (PUT boot source, rootfs, machine config, network-interface, vsock), fires `InstanceStart`. Env vars pass via kernel boot args.
 - **Snapshot/restore** — `CreateGolden` boots a temp VM, pre-warms Python kernel, pauses, writes a full snapshot. Restore loads snapshot and polls `/health` (no READY handshake needed since daemon was already running).
 - **Vsock transport** — custom `http.Transport` that dials the vsock UDS, sends `CONNECT 1024\n`, reads `OK <port>\n`, then uses the connection as TCP to the daemon.
 
 ### Dockerfile stages
 
-`daemon/cmd/Dockerfile` is a 4-stage build: `builder` (Rust musl) → `base` (Python + ixd) → `browser` (Node.js + Chrome + Pinchtab) → `full` (scientific Python + doc generation tools).
+`daemon/cmd/Dockerfile` has 4 stages: `builder` (Rust musl) → `base` (Python + Node.js + ixd) → `browser` (Chrome + Pinchtab), plus a standalone `browser-vm` stage (Chrome + pinchtab server only — no ixd/Python/Node) for the shared browser-tier VM.
 
 ## Runtime
 
-Production uses Firecracker MicroVMs (KVM) with `passt` for user-mode networking. The Docker image (`daemon/cmd/Dockerfile`) is used to build rootfs images and for Docker-based dev/CI. Design specs for ongoing work are in `docs/superpowers/specs/`.
+Production uses Firecracker MicroVMs (KVM) with per-VM TAP devices + host NAT for outbound networking. The Docker image (`daemon/cmd/Dockerfile`) is used to build rootfs images and for Docker-based dev/CI. Design specs for ongoing work are in `docs/superpowers/specs/`; reader-facing documentation is in `docs/handbook/`.

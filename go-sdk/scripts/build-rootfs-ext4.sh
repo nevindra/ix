@@ -7,7 +7,7 @@ IX_ROOTFS_SIZE="${IX_ROOTFS_SIZE:-2048}"
 IX_ROOTFS_IMAGE="${IX_ROOTFS_IMAGE:-/opt/ix/rootfs/${TIER}.ext4}"
 TEMP_ROOTFS=""
 
-readonly VALID_TIERS=("base" "browser" "full" "browser-vm")
+readonly VALID_TIERS=("base" "browser" "browser-vm")
 readonly IMAGE_TAG="ix:${TIER}"
 readonly DAEMON_BIN="../daemon/target/x86_64-unknown-linux-musl/release/ixd"
 

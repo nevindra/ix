@@ -11,19 +11,43 @@ RUN rustup target add x86_64-unknown-linux-musl && \
     cp target/x86_64-unknown-linux-musl/release/ixd /ixd
 
 # Stage 2: Base image
+#
+# The full per-chat sandbox runtime minus the browser: Python AND Node live
+# here so the ix-code REPL works for every advertised language on every tier
+# (the execute_code tool offers python/javascript/bash regardless of tier).
 FROM ubuntu:24.04 AS base
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV LANG=C.UTF-8
 
-# Runtime system packages
+# Runtime system packages (libatomic1 is a Node.js runtime dependency)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     bash ca-certificates curl git jq ripgrep fd-find unzip \
     python3 python3-pip python3-venv \
+    libatomic1 \
     && rm -rf /var/lib/apt/lists/*
 
-# uv (fast Python package installer, used by the full stage)
+# uv (fast Python package installer — lets agents install packages at runtime)
 COPY --from=ghcr.io/astral-sh/uv:0.11.2 /uv /usr/local/bin/uv
+
+# Node.js via fnm. The symlinks into /usr/local/bin matter: Docker ENV PATH
+# does not survive into a Firecracker VM (which boots via init=/sbin/ix-init),
+# and ix-code spawns a bare `node` from PATH — without the links the JS REPL
+# only works in Docker mode, never inside a VM.
+ENV FNM_DIR=/root/.local/share/fnm
+ENV PATH="/root/.local/share/fnm:${PATH}"
+RUN curl -fsSL https://fnm.vercel.app/install | bash -s -- --install-dir /root/.local/share/fnm --skip-shell && \
+    eval "$(fnm env)" && \
+    fnm install 25 && \
+    fnm default 25 && \
+    export PATH="/root/.local/share/fnm/aliases/default/bin:$PATH" && \
+    npm install -g pnpm && \
+    ln -sf /root/.local/share/fnm/aliases/default/bin/node /usr/local/bin/node && \
+    ln -sf /root/.local/share/fnm/aliases/default/bin/npm /usr/local/bin/npm && \
+    ln -sf /root/.local/share/fnm/aliases/default/bin/npx /usr/local/bin/npx
+ENV PATH="/root/.local/share/fnm/aliases/default/bin:${PATH}"
+ENV PNPM_HOME=/root/.local/share/pnpm
+ENV PATH="${PNPM_HOME}:${PNPM_HOME}/bin:${PATH}"
 
 # Rust daemon binary
 COPY --from=builder /ixd /usr/local/bin/ixd
@@ -33,25 +57,9 @@ EXPOSE 8080
 CMD ["ixd"]
 
 # Stage 3: Browser image (extends base)
+#
+# A per-chat sandbox that can ALSO drive a browser: base + Chrome + pinchtab.
 FROM base AS browser
-
-# Node.js runtime needs libatomic1 (previously pulled in transitively by gcc)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        libatomic1 \
-    && rm -rf /var/lib/apt/lists/*
-
-# Node.js via fnm
-ENV FNM_DIR=/root/.local/share/fnm
-ENV PATH="/root/.local/share/fnm:${PATH}"
-RUN curl -fsSL https://fnm.vercel.app/install | bash -s -- --install-dir /root/.local/share/fnm --skip-shell && \
-    eval "$(fnm env)" && \
-    fnm install 25 && \
-    fnm default 25 && \
-    export PATH="/root/.local/share/fnm/aliases/default/bin:$PATH" && \
-    npm install -g pnpm
-ENV PATH="/root/.local/share/fnm/aliases/default/bin:${PATH}"
-ENV PNPM_HOME=/root/.local/share/pnpm
-ENV PATH="${PNPM_HOME}:${PNPM_HOME}/bin:${PATH}"
 
 # Google Chrome
 RUN apt-get update && apt-get install -y --no-install-recommends gnupg && \
@@ -64,25 +72,43 @@ ENV CHROME_BIN=/usr/bin/google-chrome-stable
 # Pinchtab browser bridge
 COPY --from=pinchtab/pinchtab:latest /usr/local/bin/pinchtab /usr/local/bin/pinchtab
 
-# Node.js tools
+# Node.js tools (Node itself comes from base)
 RUN pnpm add -g playwright-core
 
-# Stage 5: Browser-tier VM image (extends browser, no ixd)
+# Stage 4: Browser-tier VM image (standalone — deliberately NOT built on base)
 #
-# This stage is the rootfs for a dedicated Firecracker browser-tier VM.
-# It runs pinchtab in SERVER mode (one HTTP server managing many isolated
-# Chrome instances) and bridges AF_VSOCK:1024 → TCP 127.0.0.1:9867 so the
-# host-side Gateway can reach pinchtab over the Firecracker vsock transport.
-# ixd is NOT started; CMD is the init script which becomes PID 1.
-FROM browser AS browser-vm
+# This stage is the rootfs for the dedicated Firecracker browser-tier VM in
+# shared-browser mode. That VM only ever runs pinchtab in SERVER mode (one
+# HTTP server managing many isolated Chrome instances) plus a socat bridge
+# from AF_VSOCK:1024 → TCP 127.0.0.1:9867 so the host-side Gateway can reach
+# pinchtab over the Firecracker vsock transport.
+#
+# It therefore needs NO ixd, NO Python, NO Node — just Chrome, pinchtab, and
+# the three tools the init script uses:
+#   socat    — bridges AF_VSOCK (Firecracker host→guest) to pinchtab's TCP listener
+#   wget     — health-polls pinchtab before socat starts
+#   iproute2 — `ip link set lo up`; Firecracker guests boot with loopback DOWN,
+#              and pinchtab/socat both use 127.0.0.1
+#
+# The Chrome install block is duplicated from the browser stage on purpose:
+# inheriting from `browser` would drag in ~700 MB of sandbox runtime this VM
+# never executes, and a standalone stage means base/browser changes no longer
+# invalidate this image's build cache.
+FROM ubuntu:24.04 AS browser-vm
 
-# socat: bridges AF_VSOCK (Firecracker host→guest) to pinchtab's TCP listener.
-# wget: used by browser-vm-init.sh to health-poll pinchtab before socat starts.
-# iproute2: `ip link set lo up` — Firecracker guests boot with loopback DOWN,
-# and pinchtab/socat both use 127.0.0.1, which is unreachable until lo is up.
+ENV DEBIAN_FRONTEND=noninteractive
+ENV LANG=C.UTF-8
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        socat wget iproute2 \
+        ca-certificates curl gnupg socat wget iproute2 \
+    && curl -fsSL https://dl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg \
+    && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list \
+    && apt-get update && apt-get install -y --no-install-recommends google-chrome-stable \
     && rm -rf /var/lib/apt/lists/*
+ENV CHROME_BIN=/usr/bin/google-chrome-stable
+
+# Pinchtab browser bridge (server mode)
+COPY --from=pinchtab/pinchtab:latest /usr/local/bin/pinchtab /usr/local/bin/pinchtab
 
 # Persistent browser-state directory (Chrome profiles / cookies).
 # In production this path is backed by a second ext4 block device attached
@@ -94,18 +120,3 @@ COPY cmd/browser-vm-init.sh /usr/local/bin/browser-vm-init
 RUN chmod +x /usr/local/bin/browser-vm-init
 
 CMD ["/usr/local/bin/browser-vm-init"]
-
-# Stage 4: Full image (extends browser)
-FROM browser AS full
-
-# Scientific Python packages (build deps installed and purged in same layer;
-# libcairo2 is installed explicitly so cairosvg can dlopen it at runtime)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        gcc python3-dev libffi-dev libjpeg-dev libpng-dev libcairo2-dev pkg-config \
-        libcairo2 \
-    && uv pip install --system --break-system-packages \
-        numpy pandas matplotlib seaborn Pillow \
-        python-docx openpyxl pypdf jinja2 cairosvg \
-    && apt-get purge -y gcc python3-dev libffi-dev libjpeg-dev libpng-dev libcairo2-dev pkg-config \
-    && apt-get autoremove -y \
-    && rm -rf /var/lib/apt/lists/*

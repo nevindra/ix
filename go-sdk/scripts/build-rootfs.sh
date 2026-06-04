@@ -4,7 +4,7 @@ set -euo pipefail
 TIER="${1:-base}"
 OUT="${IX_ROOTFS_OUT:-/opt/ix/rootfs/${TIER}}"
 
-readonly VALID_TIERS=("base" "browser" "full")
+readonly VALID_TIERS=("base" "browser")
 readonly IMAGE_TAG="ix:${TIER}"
 readonly DAEMON_BIN="target/release/ix"
 
