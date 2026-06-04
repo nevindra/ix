@@ -120,8 +120,8 @@ The benchmark table in the README compares an older Docker-based approach with t
 
 | Tier | What is inside | Disk size |
 |---|---|---|
-| `base` | Ubuntu 24.04 + Python + Node.js + ixd | ~600 MB |
-| `browser` | base + Chrome + Pinchtab (browser driver) | ~1.5 GB |
+| `base` | Ubuntu 24.04 + Python + Node.js + ixd | ~750 MB |
+| `browser` | base + Chrome + Pinchtab (browser driver) | ~1.9 GB |
 
 Start with `base` unless your agent needs to browse the web inside its own VM (use `browser`). A smaller image means faster rootfs loads and less disk pressure when running many VMs. (Need extra Python packages? Agents can install them at runtime with `uv`, or you can bake them into a custom Docker stage.)
 

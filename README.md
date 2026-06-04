@@ -196,9 +196,9 @@ cd go-sdk
 
 | Tier | Contents | Size |
 |---|---|---|
-| `base` | Ubuntu 24.04 + Python + Node.js + ix daemon | ~600 MB |
-| `browser` | base + Chrome + Pinchtab | ~1.5 GB |
-| `browser-vm` | Chrome + Pinchtab server only (standalone slim; no ixd) — for the shared browser tier | ~1 GB |
+| `base` | Ubuntu 24.04 + Python + Node.js + ix daemon | ~750 MB |
+| `browser` | base + Chrome + Pinchtab | ~1.9 GB |
+| `browser-vm` | Chrome + Pinchtab server only (standalone slim; no ixd) — for the shared browser tier | ~1.3 GB |
 
 Build a specific tier:
 

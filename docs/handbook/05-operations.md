@@ -95,17 +95,18 @@ flowchart TD
 
 | Tier | Docker stage | Contents | Approx. size | When you need it |
 |---|---|---|---|---|
-| `base` | `base` | Ubuntu 24.04, Python 3, Node.js, uv, git, curl, `ixd` | ~600 MB | Default — all non-browser workloads |
-| `browser` | `browser` | base + Chrome, Pinchtab, playwright-core | ~1.5 GB | Per-chat in-VM Chrome (mode 1) |
-| `browser-vm` | `browser-vm` | **Standalone slim**: Chrome + Pinchtab server + socat/wget/iproute2 only — **no `ixd`, no Python, no Node** | ~1 GB | Shared browser tier only (mode 2) |
+| `base` | `base` | Ubuntu 24.04, Python 3, Node.js, uv, git, curl, `ixd` | ~750 MB | Default — all non-browser workloads |
+| `browser` | `browser` | base + Chrome, Pinchtab, playwright-core | ~1.9 GB | Per-chat in-VM Chrome (mode 1) |
+| `browser-vm` | `browser-vm` | **Standalone slim**: Chrome + Pinchtab server + socat/wget/iproute2 only — **no `ixd`, no Python, no Node** | ~1.3 GB | Shared browser tier only (mode 2) |
 
 Need scientific Python (numpy, pandas, matplotlib, …)? There is deliberately no pre-baked tier for it — agents can `uv pip install` packages at runtime, or you can add your own Docker stage on top of `browser`.
 
 Two structural notes:
 
-- `base` includes Node.js (with `node`/`npm`/`npx` symlinked into `/usr/local/bin`) so the
-  `execute_code` JS REPL works on every tier — the symlinks matter because Docker `ENV PATH`
-  does not survive into a Firecracker VM.
+- `base` includes Node.js, installed from the official nodejs.org tarball straight into
+  `/usr/local` so `node`/`npm`/`npx` sit on the default PATH — that placement matters because
+  Docker `ENV PATH` does not survive into a Firecracker VM, and the `execute_code` JS REPL
+  spawns a bare `node` from PATH.
 - `browser-vm` is deliberately **not** built on the other stages: the dedicated browser VM only
   runs Pinchtab in server mode plus Chrome, so it skips the entire sandbox runtime. Its init
   script is `browser-vm-init.sh`, not `ix-init.sh`, and `ixd` is absent.

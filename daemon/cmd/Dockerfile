@@ -20,32 +20,28 @@ FROM ubuntu:24.04 AS base
 ENV DEBIAN_FRONTEND=noninteractive
 ENV LANG=C.UTF-8
 
-# Runtime system packages (libatomic1 is a Node.js runtime dependency)
+# Runtime system packages (libatomic1 is a Node.js runtime dependency;
+# xz-utils unpacks the Node tarball)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     bash ca-certificates curl git jq ripgrep fd-find unzip \
     python3 python3-pip python3-venv \
-    libatomic1 \
+    libatomic1 xz-utils \
     && rm -rf /var/lib/apt/lists/*
 
 # uv (fast Python package installer — lets agents install packages at runtime)
 COPY --from=ghcr.io/astral-sh/uv:0.11.2 /uv /usr/local/bin/uv
 
-# Node.js via fnm. The symlinks into /usr/local/bin matter: Docker ENV PATH
-# does not survive into a Firecracker VM (which boots via init=/sbin/ix-init),
-# and ix-code spawns a bare `node` from PATH — without the links the JS REPL
-# only works in Docker mode, never inside a VM.
-ENV FNM_DIR=/root/.local/share/fnm
-ENV PATH="/root/.local/share/fnm:${PATH}"
-RUN curl -fsSL https://fnm.vercel.app/install | bash -s -- --install-dir /root/.local/share/fnm --skip-shell && \
-    eval "$(fnm env)" && \
-    fnm install 25 && \
-    fnm default 25 && \
-    export PATH="/root/.local/share/fnm/aliases/default/bin:$PATH" && \
-    npm install -g pnpm && \
-    ln -sf /root/.local/share/fnm/aliases/default/bin/node /usr/local/bin/node && \
-    ln -sf /root/.local/share/fnm/aliases/default/bin/npm /usr/local/bin/npm && \
-    ln -sf /root/.local/share/fnm/aliases/default/bin/npx /usr/local/bin/npx
-ENV PATH="/root/.local/share/fnm/aliases/default/bin:${PATH}"
+# Node.js — pinned tarball straight from nodejs.org into /usr/local, so
+# node/npm/npx land on the default PATH both in Docker AND inside VMs
+# (Docker ENV PATH does not survive into a Firecracker VM, and ix-code
+# spawns a bare `node` from PATH). An immutable image needs no version
+# manager, and GitHub release downloads are unreliable from Docker build
+# networks — nodejs.org is the dependable source.
+ARG NODE_VERSION=25.1.0
+RUN curl -fsSL --retry 3 "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz" \
+      | tar -xJ -C /usr/local --strip-components=1 \
+    && node --version && npm --version \
+    && npm install -g pnpm
 ENV PNPM_HOME=/root/.local/share/pnpm
 ENV PATH="${PNPM_HOME}:${PNPM_HOME}/bin:${PATH}"
 
