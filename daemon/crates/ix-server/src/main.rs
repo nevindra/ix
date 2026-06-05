@@ -99,6 +99,7 @@ async fn main() {
     };
 
     let kernels = Arc::new(ix_code::KernelManager::new());
+    let shell_sessions = ix_shell::SessionManager::new_shared();
 
     let egress = if config.egress.enabled {
         match ix_egress::EgressFilter::start(config.egress.clone()).await {
@@ -119,6 +120,7 @@ async fn main() {
         config,
         browser: browser_trait,
         kernels: kernels.clone(),
+        shell_sessions: shell_sessions.clone(),
         egress: egress.clone(),
         start_time: std::time::Instant::now(),
     });
@@ -202,6 +204,7 @@ async fn main() {
     // 7. Cleanup on shutdown
     info!("shutting down...");
     kernels.shutdown().await;
+    shell_sessions.shutdown().await;
     if let Some(egress) = egress {
         if let Ok(filter) = Arc::try_unwrap(egress) {
             filter.shutdown().await;

@@ -16,10 +16,29 @@
 
 set -euo pipefail
 
+# Compare two saved runs: ./scripts/run-benchmarks.sh compare old.txt new.txt
+if [[ "${1:-}" == "compare" ]]; then
+    if [[ $# -lt 3 ]]; then
+        echo "usage: $0 compare <old.txt> <new.txt>" >&2
+        exit 1
+    fi
+    command -v benchstat >/dev/null || {
+        echo "benchstat not found: go install golang.org/x/perf/cmd/benchstat@latest" >&2
+        exit 1
+    }
+    exec benchstat "$2" "$3"
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 ITERATIONS="${1:-5}"
+
+# COUNT > 1 repeats every benchmark for benchstat-grade variance data.
+COUNT="${COUNT:-1}"
+RESULTS_DIR="${REPO_ROOT}/bench-results"
+mkdir -p "${RESULTS_DIR}"
+OUT_FILE="${RESULTS_DIR}/bench-$(date +%Y%m%d-%H%M%S).txt"
 
 # ── Docker baselines from the spec (ms) ───────────────────────────────────────
 DOCKER_CREATE=368
@@ -54,26 +73,32 @@ echo "  IX_KERNEL_PATH  = ${IX_KERNEL_PATH:-/opt/ix/firecracker/vmlinux.bin}"
 echo "  IX_FC_BINARY    = ${IX_FC_BINARY:-(PATH lookup)}"
 echo ""
 
-RAW_OUTPUT=$(cd "${REPO_ROOT}" && go test \
+set +e
+cd "${REPO_ROOT}" && go test \
     -bench=. \
     -benchtime="${ITERATIONS}x" \
     -tags=integration \
-    -count=1 \
-    -timeout=30m \
-    2>&1)
+    -count="${COUNT}" \
+    -timeout=60m \
+    2>&1 | tee "${OUT_FILE}"
+bench_status=${PIPESTATUS[0]}
+set -e
 
-echo "${RAW_OUTPUT}"
+RAW_OUTPUT=$(cat "${OUT_FILE}")
+
+echo ""
+echo "Raw results saved to: ${OUT_FILE}  (compare runs with: $0 compare old.txt new.txt)"
 echo ""
 
 # ── Parse ns/op values ────────────────────────────────────────────────────────
 # grep a benchmark name and return its ns/op value (or "N/A" if not found).
+# Multiple lines (COUNT>1) are averaged.
 get_ns() {
     local name="$1"
-    # line format: BenchmarkFoo-N   5   123456789 ns/op
     local ns
     ns=$(printf '%s\n' "${RAW_OUTPUT}" \
-        | grep -E "^${name}[^0-9]" \
-        | awk '{for(i=1;i<=NF;i++) if($(i+1)=="ns/op") {print $i; exit}}')
+        | grep -E "^${name}[^0-9a-zA-Z]" \
+        | awk '{for(i=1;i<=NF;i++) if($(i+1)=="ns/op") {sum+=$i; n++}} END {if(n) printf "%d", sum/n}')
     printf '%s' "${ns:-N/A}"
 }
 
@@ -175,3 +200,5 @@ row "E2E agent cycle"       "${ms_e2e}"                "${TARGET_E2E}"          
 
 printf "  %s\n\n" "${SEP}"
 printf "  ${GRN}green${RST} = at or below target   ${RED}red${RST} = above target\n\n"
+
+exit "${bench_status}"

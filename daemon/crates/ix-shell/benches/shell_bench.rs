@@ -32,6 +32,7 @@ fn bench_spawn_overhead(c: &mut Criterion) {
                     command: "echo hello".to_string(),
                     cwd: None,
                     timeout: None,
+                    session_id: None,
                 };
                 let (sender, rx) = test_channel(128);
                 tokio::join!(execute_shell(req, sender), drain_events(rx));
@@ -60,6 +61,7 @@ fn bench_throughput_1000_lines(c: &mut Criterion) {
                     command: "for i in $(seq 1 1000); do echo \"line $i\"; done".to_string(),
                     cwd: None,
                     timeout: Some(30),
+                    session_id: None,
                 };
                 let (sender, rx) = test_channel(1024);
                 tokio::join!(execute_shell(req, sender), drain_events(rx));

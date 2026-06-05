@@ -124,6 +124,7 @@ fn make_state_with_browser(
         config,
         browser,
         kernels: Arc::new(ix_code::KernelManager::new()),
+        shell_sessions: ix_shell::SessionManager::new_shared(),
         egress: None,
         start_time: std::time::Instant::now(),
     })

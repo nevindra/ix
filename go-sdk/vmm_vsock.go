@@ -73,6 +73,7 @@ func (fb *firecrackerBackend) waitReady(ctx context.Context, handle *VMMHandle) 
 func vsockTransport(vsockUDS string) http.RoundTripper {
 	return &http.Transport{
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			dialCount.Add(1)
 			conn, err := (&net.Dialer{}).DialContext(ctx, "unix", vsockUDS)
 			if err != nil {
 				return nil, fmt.Errorf("dial vsock UDS: %w", err)
@@ -99,6 +100,13 @@ func vsockTransport(vsockUDS string) http.RoundTripper {
 			// Return a conn that uses the buffered reader for remaining data.
 			return &vsockConn{Conn: conn, reader: reader}, nil
 		},
+		// The daemon terminates SSE streams after the final event, so
+		// connections come back to this pool instead of re-dialing the UDS
+		// + CONNECT handshake per request.
+		MaxIdleConns:        8,
+		MaxIdleConnsPerHost: 8,
+		IdleConnTimeout:     90 * time.Second,
+		DisableCompression:  true,
 	}
 }
 

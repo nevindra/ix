@@ -3,8 +3,10 @@
 package ix
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"testing"
 	"time"
@@ -48,6 +50,33 @@ func waitPoolFill(m *IXManager, minReady int) {
 	}
 }
 
+// benchSandbox creates a manager + one sandbox for op-latency benchmarks and
+// registers cleanup. Pass UseSnapshot/PoolSize via cfg overrides.
+func benchSandbox(b *testing.B, sid string, mutate func(*ManagerConfig)) (*IXManager, sandbox.Sandbox) {
+	b.Helper()
+	ctx := context.Background()
+	cfg := ManagerConfig{
+		RootfsImage: rootfsImage(),
+		KernelPath:  kernelPath(),
+		FCBinary:    fcBinary(),
+		DefaultTTL:  10 * time.Minute,
+	}
+	if mutate != nil {
+		mutate(&cfg)
+	}
+	mgr, err := NewManager(ctx, cfg)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { mgr.Close() })
+	sb, err := mgr.Create(ctx, sandbox.CreateOpts{SessionID: sid})
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { _ = mgr.Destroy(context.Background(), sb.(*IXSandbox).id) })
+	return mgr, sb
+}
+
 // BenchmarkCreateCold measures cold VM creation latency (no pool).
 func BenchmarkCreateCold(b *testing.B) {
 	ctx := context.Background()
@@ -73,9 +102,11 @@ func BenchmarkCreateCold(b *testing.B) {
 		if err != nil {
 			b.Fatalf("Create: %v", err)
 		}
+		b.StopTimer()
 		if err := mgr.Destroy(ctx, sb.(*IXSandbox).id); err != nil {
 			b.Fatalf("Destroy: %v", err)
 		}
+		b.StartTimer()
 	}
 }
 
@@ -96,23 +127,32 @@ func BenchmarkCreateFromPool(b *testing.B) {
 	}
 	defer mgr.Close()
 
-	// Wait for pool to fill before benchmarking.
-	waitPoolFill(mgr, 1)
-
 	b.ReportAllocs()
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
+		// Replenishment is async: never time a pool-miss (it would silently
+		// measure a ~600 ms cold boot instead of a pool grab).
+		b.StopTimer()
+		waitPoolFill(mgr, 1)
+		b.StartTimer()
+
 		sid := fmt.Sprintf("bench-pool-%d", i)
 		sb, err := mgr.Create(ctx, sandbox.CreateOpts{SessionID: sid})
 		if err != nil {
 			b.Fatalf("Create: %v", err)
 		}
+
+		// Destroy is measured by BenchmarkDestroy; keep it out of "creation".
+		b.StopTimer()
 		if err := mgr.Destroy(ctx, sb.(*IXSandbox).id); err != nil {
 			b.Fatalf("Destroy: %v", err)
 		}
-		// Give the pool replenisher a moment to refill between iterations.
-		time.Sleep(100 * time.Millisecond)
+		b.StartTimer()
+	}
+
+	if got := mgr.poolHits.Load(); got < int64(b.N) {
+		b.Fatalf("pool misses: only %d/%d creates were pool hits", got, b.N)
 	}
 }
 
@@ -360,6 +400,10 @@ func BenchmarkCreatePoolPreWarmed(b *testing.B) {
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		waitPoolFill(mgr, 1)
+		b.StartTimer()
+
 		sid := fmt.Sprintf("bench-prewarmed-%d", i)
 
 		// Pool grab: VM already running with Python kernel booted.
@@ -373,11 +417,15 @@ func BenchmarkCreatePoolPreWarmed(b *testing.B) {
 			b.Fatalf("ExecCode: %v", err)
 		}
 
+		b.StopTimer()
 		if err := mgr.Destroy(ctx, sb.(*IXSandbox).id); err != nil {
 			b.Fatalf("Destroy: %v", err)
 		}
-		// Allow the pool replenisher to refill before the next iteration.
-		time.Sleep(100 * time.Millisecond)
+		b.StartTimer()
+	}
+
+	if got := mgr.poolHits.Load(); got < int64(b.N) {
+		b.Fatalf("pool misses: only %d/%d creates were pool hits", got, b.N)
 	}
 }
 
@@ -550,9 +598,11 @@ func BenchmarkCreateFromSnapshot(b *testing.B) {
 		if err != nil {
 			b.Fatalf("Create: %v", err)
 		}
+		b.StopTimer()
 		if err := mgr.Destroy(ctx, sb.(*IXSandbox).id); err != nil {
 			b.Fatalf("Destroy: %v", err)
 		}
+		b.StartTimer()
 	}
 }
 
@@ -669,6 +719,149 @@ func BenchmarkCodeExecSnapshot(b *testing.B) {
 		_, err := sb.ExecCode(ctx, sandbox.CodeRequest{Language: "python", Code: "x = 42"})
 		if err != nil {
 			b.Fatalf("ExecCode: %v", err)
+		}
+	}
+}
+
+// BenchmarkFileReadWriteWorkspace measures write+read on /workspace — the
+// scratch-backed agent workspace path. BenchmarkFileReadWrite hits /tmp,
+// which ix-init mounts as tmpfs, so it never exercises the disk write path.
+func BenchmarkFileReadWriteWorkspace(b *testing.B) {
+	ctx := context.Background()
+	_, sb := benchSandbox(b, "bench-file-ws", nil)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := sb.WriteFile(ctx, sandbox.WriteFileRequest{
+			Path:    "/workspace/bench.txt",
+			Content: "hello",
+		}); err != nil {
+			b.Fatalf("WriteFile: %v", err)
+		}
+		if _, err := sb.ReadFile(ctx, sandbox.ReadFileRequest{Path: "/workspace/bench.txt"}); err != nil {
+			b.Fatalf("ReadFile: %v", err)
+		}
+	}
+}
+
+// BenchmarkUploadDownload measures a 64 KB multipart upload + raw download.
+func BenchmarkUploadDownload(b *testing.B) {
+	ctx := context.Background()
+	_, sb := benchSandbox(b, "bench-updown", nil)
+	payload := bytes.Repeat([]byte("x"), 64<<10)
+	ix := sb.(*IXSandbox)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := ix.UploadFile(ctx, "/workspace/blob.bin", bytes.NewReader(payload)); err != nil {
+			b.Fatalf("UploadFile: %v", err)
+		}
+		rc, err := ix.DownloadFile(ctx, "/workspace/blob.bin")
+		if err != nil {
+			b.Fatalf("DownloadFile: %v", err)
+		}
+		if _, err := io.Copy(io.Discard, rc); err != nil {
+			b.Fatalf("read download: %v", err)
+		}
+		rc.Close()
+	}
+}
+
+// BenchmarkGrep measures a content search across 50 pre-written files.
+func BenchmarkGrep(b *testing.B) {
+	ctx := context.Background()
+	_, sb := benchSandbox(b, "bench-grep", nil)
+	for i := 0; i < 50; i++ {
+		content := fmt.Sprintf("line one\nneedle-%d in file\nline three\n", i)
+		if err := sb.WriteFile(ctx, sandbox.WriteFileRequest{
+			Path:    fmt.Sprintf("/workspace/grep/f%02d.txt", i),
+			Content: content,
+		}); err != nil {
+			b.Fatalf("setup WriteFile: %v", err)
+		}
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := sb.GrepFiles(ctx, sandbox.GrepRequest{
+			Pattern: "needle",
+			Path:    "/workspace/grep",
+		}); err != nil {
+			b.Fatalf("GrepFiles: %v", err)
+		}
+	}
+}
+
+// BenchmarkGlob measures pattern matching over the same 50-file tree.
+func BenchmarkGlob(b *testing.B) {
+	ctx := context.Background()
+	_, sb := benchSandbox(b, "bench-glob", nil)
+	for i := 0; i < 50; i++ {
+		if err := sb.WriteFile(ctx, sandbox.WriteFileRequest{
+			Path:    fmt.Sprintf("/workspace/glob/f%02d.txt", i),
+			Content: "x",
+		}); err != nil {
+			b.Fatalf("setup WriteFile: %v", err)
+		}
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := sb.GlobFiles(ctx, sandbox.GlobRequest{
+			Pattern: "*.txt",
+			Path:    "/workspace/glob",
+		}); err != nil {
+			b.Fatalf("GlobFiles: %v", err)
+		}
+	}
+}
+
+// BenchmarkDestroy isolates sandbox teardown (creation runs untimed).
+// Destroy semantics change to two-phase in this release — this benchmark
+// tracks the caller-visible latency, not total cleanup IO.
+func BenchmarkDestroy(b *testing.B) {
+	ctx := context.Background()
+
+	mgr, err := NewManager(ctx, ManagerConfig{
+		RootfsImage: rootfsImage(),
+		KernelPath:  kernelPath(),
+		FCBinary:    fcBinary(),
+		UseSnapshot: true,
+		DefaultTTL:  5 * time.Minute,
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer mgr.Close()
+
+	deadline := time.Now().Add(120 * time.Second)
+	for time.Now().Before(deadline) {
+		if mgr.vmm.snapshot != nil && mgr.vmm.snapshot.Ready() {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	if mgr.vmm.snapshot == nil || !mgr.vmm.snapshot.Ready() {
+		b.Fatal("golden snapshot not ready after 120s")
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		sid := fmt.Sprintf("bench-destroy-%d", i)
+		sb, err := mgr.Create(ctx, sandbox.CreateOpts{SessionID: sid})
+		if err != nil {
+			b.Fatalf("Create: %v", err)
+		}
+		b.StartTimer()
+
+		if err := mgr.Destroy(ctx, sb.(*IXSandbox).id); err != nil {
+			b.Fatalf("Destroy: %v", err)
 		}
 	}
 }

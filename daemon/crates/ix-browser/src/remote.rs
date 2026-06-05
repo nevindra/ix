@@ -10,6 +10,15 @@ use ix_core::{Error, Result};
 use crate::backend::BrowserBackend;
 use crate::pinchtab::{build_snapshot_path, build_text_path};
 
+/// Per-request budget for heavyweight captures (screenshot/pdf), overriding
+/// the client's global 30 s timeout the same way `wait()` does. Timeout order
+/// along the chain must be strictly increasing so the most informative error
+/// wins: pinchtab actionSec (60 s) < gateway pinchtab-client (75 s) < this
+/// (90 s). The v0.7 benchmarks hit the old 30 s/30 s tie: a cold-Chrome first
+/// screenshot stalled ~30 s and the daemon aborted with a generic timeout
+/// instead of relaying pinchtab's error (or letting a slow capture finish).
+const CAPTURE_TIMEOUT: Duration = Duration::from_secs(90);
+
 /// Browser backend that proxies every call to a shared Browser Gateway over
 /// HTTP. Selected when `IX_BROWSER_MODE=remote=<url>`.
 pub struct RemoteSharedBrowserBackend {
@@ -92,7 +101,7 @@ impl RemoteSharedBrowserBackend {
     async fn get_bytes(&self, path: &str) -> Result<Vec<u8>> {
         let url = format!("{}{}", self.gateway_url, path);
         let resp = self
-            .apply_headers(self.client.get(&url))
+            .apply_headers(self.client.get(&url).timeout(CAPTURE_TIMEOUT))
             .send()
             .await
             .map_err(|e| Error::Internal(format!("gateway request failed: {e}")))?;
@@ -155,14 +164,10 @@ impl BrowserBackend for RemoteSharedBrowserBackend {
     }
 
     async fn eval(&self, expr: &str) -> Result<String> {
-        #[derive(serde::Deserialize)]
-        struct EvalResponse {
-            result: String,
-        }
-        let resp: EvalResponse = self
+        let resp: crate::eval::EvalResponse = self
             .post_json("/v1/browser/evaluate", &serde_json::json!({ "expression": expr }))
             .await?;
-        Ok(resp.result)
+        Ok(resp.into_string())
     }
 
     async fn find(&self, query: &str) -> Result<BrowserFindResult> {
@@ -296,6 +301,44 @@ mod tests {
             RemoteSharedBrowserBackend::new(server.uri(), "c".into(), &policy(), None);
         let snap = backend.snapshot(SnapshotOpts::default()).await.unwrap();
         assert_eq!(snap.url, "https://example.com");
+    }
+
+    #[tokio::test]
+    async fn eval_parses_non_string_results() {
+        // pinchtab returns the RAW JSON value of the expression: `1+1` comes
+        // back as {"result": 2}. Regression test for the v0.7 benchmark
+        // failure where `result: String` rejected every non-string value.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/browser/evaluate"))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "expression": "1+1"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": 2
+            })))
+            .mount(&server)
+            .await;
+
+        let backend =
+            RemoteSharedBrowserBackend::new(server.uri(), "c".into(), &policy(), None);
+        assert_eq!(backend.eval("1+1").await.unwrap(), "2");
+    }
+
+    #[tokio::test]
+    async fn eval_passes_string_results_through() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/browser/evaluate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": "ix bench page"
+            })))
+            .mount(&server)
+            .await;
+
+        let backend =
+            RemoteSharedBrowserBackend::new(server.uri(), "c".into(), &policy(), None);
+        assert_eq!(backend.eval("document.title").await.unwrap(), "ix bench page");
     }
 
     #[tokio::test]

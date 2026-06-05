@@ -77,7 +77,9 @@ func (m *IXManager) reapDisk(ctx context.Context) {
 
 // recover scans RunDir (current per-VM dirs) and /tmp (leftovers from
 // pre-RunDir versions) for orphaned ix-* socket directories left by a previous
-// manager instance and removes them. VM process recovery is not supported in
+// manager instance and removes them. This includes two-phase-destroy
+// tombstones ("ix-<id>.deleting.<n>") orphaned by a crash between the rename
+// and the background delete. VM process recovery is not supported in
 // Phase 1 — we cannot reliably identify which processes belong to us across
 // restarts without a process registry.
 func (m *IXManager) recover(ctx context.Context) error {

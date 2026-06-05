@@ -9,13 +9,20 @@ use ix_core::types::ShellRequest;
 use crate::state::AppState;
 
 pub async fn shell_exec(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     Json(req): Json<ShellRequest>,
 ) -> SseResponse {
     let (sender, sse) = ix_core::sse::sse_channel(32);
-    tokio::spawn(async move {
-        ix_shell::execute_shell(req, sender).await;
-    });
+    if req.session_id.is_some() {
+        let sessions = state.shell_sessions.clone();
+        tokio::spawn(async move {
+            sessions.execute(req, sender).await;
+        });
+    } else {
+        tokio::spawn(async move {
+            ix_shell::execute_shell(req, sender).await;
+        });
+    }
     sse
 }
 

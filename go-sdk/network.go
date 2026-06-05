@@ -12,20 +12,21 @@ import (
 	"time"
 )
 
-// waitForFile polls for the existence of a file with a timeout.
+// waitForFile polls for the existence of a file with a timeout. The first
+// check is immediate (a freshly-forked Firecracker binds its API socket in
+// well under a tick); subsequent checks run every 1 ms.
 func waitForFile(path string, timeout time.Duration) error {
-	deadline := time.After(timeout)
-	ticker := time.NewTicker(5 * time.Millisecond)
+	deadline := time.Now().Add(timeout)
+	ticker := time.NewTicker(1 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		select {
-		case <-deadline:
-			return fmt.Errorf("file not found after %v: %s", timeout, path)
-		case <-ticker.C:
-			if _, err := os.Stat(path); err == nil {
-				return nil
-			}
+		if _, err := os.Stat(path); err == nil {
+			return nil
 		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("file not found after %v: %s", timeout, path)
+		}
+		<-ticker.C
 	}
 }
 

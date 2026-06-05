@@ -18,7 +18,12 @@ import (
 func NewGatewayForBrowserVM(vsockUDS, pinchtabToken string, maxInflight int, logger *slog.Logger) *Gateway {
 	client := &http.Client{
 		Transport: vsockTransport(vsockUDS),
-		Timeout:   60 * time.Second,
+		// Timeout order along the capture chain must be strictly increasing so
+		// the most informative error wins: pinchtab actionSec (60s, set by
+		// browser-vm-init.sh) < this client (75s) < the daemon's capture
+		// timeout (90s, ix-browser remote.rs). At 60s this tied pinchtab's
+		// handler timeout exactly, racing it to a generic client abort.
+		Timeout: 75 * time.Second,
 	}
 	return NewGateway(GatewayConfig{
 		// The host "browser-vm" is ignored by the vsock transport's DialContext;

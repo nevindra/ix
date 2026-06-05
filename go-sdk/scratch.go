@@ -49,7 +49,10 @@ func ensureScratchTemplate(path string, sizeMB int64) error {
 	}
 	f.Close()
 
-	if out, err := exec.Command("mkfs.ext4", "-F", "-q", tmp).CombinedOutput(); err != nil {
+	// ^has_journal: the scratch is ephemeral by design (per-VM, deleted on
+	// destroy) — journaling buys crash-consistency nobody reads, and costs
+	// extra writes on the agent's /workspace hot path.
+	if out, err := exec.Command("mkfs.ext4", "-F", "-q", "-O", "^has_journal", tmp).CombinedOutput(); err != nil {
 		_ = os.Remove(tmp)
 		return fmt.Errorf("mkfs.ext4 scratch template: %w: %s", err, out)
 	}

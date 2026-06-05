@@ -3,8 +3,11 @@
 package ix
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestDeriveVMNet(t *testing.T) {
@@ -161,6 +164,20 @@ func TestNftRulesetAnyEgress(t *testing.T) {
 	}
 	if strings.Contains(rs, `oifname "" masquerade`) {
 		t.Errorf("nftRuleset(\"\") must not emit an empty oifname match\n%s", rs)
+	}
+}
+
+func TestWaitForFileExistingReturnsImmediately(t *testing.T) {
+	f := filepath.Join(t.TempDir(), "exists")
+	if err := os.WriteFile(f, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	if err := waitForFile(f, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(start); elapsed > 4*time.Millisecond {
+		t.Errorf("existing file took %v — first check must not wait for a tick", elapsed)
 	}
 }
 

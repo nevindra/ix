@@ -16,7 +16,14 @@ use crate::backend::BrowserBackend;
 const PINCHTAB_TOKEN: &str = "ix-internal";
 const PINCHTAB_BASE_URL: &str = "http://127.0.0.1:9867";
 const PINCHTAB_CONFIG_PATH: &str = "/tmp/pinchtab/config.json";
-const PINCHTAB_CONFIG: &str = r#"{"server":{"port":"9867","bind":"127.0.0.1","token":"ix-internal"},"instanceDefaults":{"mode":"headless"},"security":{"idpi":{"enabled":false},"allowEvaluate":true}}"#;
+const PINCHTAB_CONFIG: &str = r#"{"server":{"port":"9867","bind":"127.0.0.1","token":"ix-internal"},"instanceDefaults":{"mode":"headless"},"security":{"idpi":{"enabled":false},"allowEvaluate":true},"timeouts":{"actionSec":60}}"#;
+
+/// Per-request budget for heavyweight captures (screenshot/pdf), overriding
+/// the client's global 30 s timeout. Must exceed pinchtab's actionSec (60 s,
+/// set in PINCHTAB_CONFIG above) so a slow capture finishes — or pinchtab's
+/// own descriptive error surfaces — instead of this client racing it to a
+/// generic timeout (the two were tied at 30 s/30 s before v0.7.1).
+const CAPTURE_TIMEOUT: Duration = Duration::from_secs(75);
 
 pub struct PinchtabBackend {
     client: reqwest::Client,
@@ -163,6 +170,7 @@ impl PinchtabBackend {
         let resp = self
             .client
             .get(&url)
+            .timeout(CAPTURE_TIMEOUT)
             .header("Authorization", self.auth_header())
             .send()
             .await
@@ -308,15 +316,10 @@ impl BrowserBackend for PinchtabBackend {
     }
 
     async fn eval(&self, expr: &str) -> Result<String> {
-        #[derive(serde::Deserialize)]
-        struct EvalResponse {
-            result: String,
-        }
-
-        let resp: EvalResponse = self
+        let resp: crate::eval::EvalResponse = self
             .post_json("/evaluate", &serde_json::json!({ "expression": expr }))
             .await?;
-        Ok(resp.result)
+        Ok(resp.into_string())
     }
 
     async fn find(&self, query: &str) -> Result<BrowserFindResult> {
@@ -456,6 +459,15 @@ mod tests {
             "security.allowEvaluate must be true — pinchtab gates /evaluate and \
              wait kind=function behind it (default false), which 403s browser_eval \
              in local mode. browser-vm-init.sh already sets it for the remote tier."
+        );
+        assert_eq!(
+            v["timeouts"]["actionSec"],
+            serde_json::Value::from(60),
+            "timeouts.actionSec must be 60 — pinchtab's default ActionTimeout (30 s) \
+             kills legitimate slow first captures (cold-Chrome screenshot stalls were \
+             observed at ~30 s in the v0.7 benchmarks) and exactly ties the daemon's \
+             old client timeout, so the caller got a generic timeout instead of \
+             pinchtab's error. Keep this BELOW the daemon's capture timeout."
         );
     }
 

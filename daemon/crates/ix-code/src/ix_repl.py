@@ -22,6 +22,8 @@ def main():
         if not code.strip():
             sys.stdout.write("__IX_RESULT__\n")
             sys.stdout.flush()
+            sys.stderr.write("__IX_RESULT__\n")
+            sys.stderr.flush()
             continue
 
         cell_count += 1
@@ -46,6 +48,8 @@ def main():
 
         sys.stdout.write("__IX_RESULT__\n")
         sys.stdout.flush()
+        sys.stderr.write("__IX_RESULT__\n")
+        sys.stderr.flush()
 
 if __name__ == "__main__":
     main()

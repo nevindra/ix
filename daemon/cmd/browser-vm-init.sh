@@ -77,6 +77,16 @@ CONFIG_PATH=/run/pinchtab-server.json
 # zero operator config. Operators override via PINCHTAB_TOKEN.
 TOKEN_VALUE="${PINCHTAB_TOKEN:-ix-internal}"
 
+# pinchtab blocks navigation whose target resolves to a private/internal IP
+# (SSRF guard). PINCHTAB_TRUSTED_RESOLVE_CIDRS (comma-separated CIDRs) opts
+# specific ranges back in via security.trustedResolveCIDRs — used by host-side
+# benchmarks that serve a hermetic test page on the gateway's link-local IP.
+# Default: empty (guard fully on).
+CIDRS_JSON="[]"
+if [ -n "${PINCHTAB_TRUSTED_RESOLVE_CIDRS:-}" ]; then
+    CIDRS_JSON="[\"$(echo "$PINCHTAB_TRUSTED_RESOLVE_CIDRS" | sed 's/,/","/g')\"]"
+fi
+
 cat > "$CONFIG_PATH" <<EOF
 {
   "configVersion": "0.8.0",
@@ -93,7 +103,11 @@ cat > "$CONFIG_PATH" <<EOF
   },
   "security": {
     "idpi": { "enabled": false },
-    "allowEvaluate": true
+    "allowEvaluate": true,
+    "trustedResolveCIDRs": ${CIDRS_JSON}
+  },
+  "timeouts": {
+    "actionSec": 60
   },
   "multiInstance": {
     "instancePortStart": 9868,

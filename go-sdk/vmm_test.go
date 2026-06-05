@@ -3,11 +3,13 @@
 package ix
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestFirecrackerConfigValidation(t *testing.T) {
@@ -47,7 +49,7 @@ func TestFirecrackerConfigValidation(t *testing.T) {
 
 func TestBuildKernelBootArgs(t *testing.T) {
 	env := []string{"IX_EGRESS_ENABLED=true", "IX_EGRESS_MODE=allow"}
-	args := buildKernelBootArgs(env, nil)
+	args := buildKernelBootArgs(env, nil, false)
 
 	if args == "" {
 		t.Fatal("expected non-empty boot args")
@@ -66,9 +68,9 @@ func TestBuildKernelBootArgs(t *testing.T) {
 		t.Errorf("boot args must not mount root rw: %s", args)
 	}
 
-	// Must contain console spec.
-	if !strings.Contains(args, "console=ttyS0") {
-		t.Errorf("boot args missing console: %s", args)
+	// Console must be absent by default (withConsole=false).
+	if strings.Contains(args, "console=ttyS0") {
+		t.Errorf("boot args must not contain console=ttyS0 with withConsole=false: %s", args)
 	}
 
 	// Env vars must appear as ix.env.* entries.
@@ -82,7 +84,7 @@ func TestBuildKernelBootArgs(t *testing.T) {
 
 func TestBuildKernelBootArgsWithNet(t *testing.T) {
 	vn := deriveVMNet(0) // host 172.16.0.1, guest 172.16.0.2
-	args := buildKernelBootArgs(nil, &vn)
+	args := buildKernelBootArgs(nil, &vn, false)
 	want := "ip=172.16.0.2::172.16.0.1:255.255.255.252::eth0:off:8.8.8.8"
 	if !strings.Contains(args, want) {
 		t.Errorf("boot args missing %q\n%s", want, args)
@@ -90,7 +92,7 @@ func TestBuildKernelBootArgsWithNet(t *testing.T) {
 }
 
 func TestBuildKernelBootArgsNoNet(t *testing.T) {
-	args := buildKernelBootArgs(nil, nil)
+	args := buildKernelBootArgs(nil, nil, false)
 	if strings.Contains(args, "ip=") {
 		t.Errorf("boot args should have no ip= when net is nil: %s", args)
 	}
@@ -162,15 +164,14 @@ func TestAllocateCID(t *testing.T) {
 }
 
 func TestBuildKernelBootArgsEmpty(t *testing.T) {
-	args := buildKernelBootArgs(nil, nil)
+	args := buildKernelBootArgs(nil, nil, false)
 
 	if args == "" {
 		t.Fatal("expected non-empty boot args even with empty env slice")
 	}
 
-	// All base args must be present.
+	// All base args must be present (console omitted: withConsole=false).
 	for _, required := range []string{
-		"console=ttyS0",
 		"reboot=k",
 		"panic=1",
 		"pci=off",
@@ -181,9 +182,14 @@ func TestBuildKernelBootArgsEmpty(t *testing.T) {
 		}
 	}
 
-	// No ix.env. entries should appear.
-	if strings.Contains(args, "ix.env.") {
-		t.Errorf("boot args should not contain ix.env.* with empty env: %s", args)
+	// Quiet mode: no console=ttyS0, but 8250.nr_uarts=0 and quiet must be present.
+	if strings.Contains(args, "console=ttyS0") {
+		t.Errorf("boot args must not contain console=ttyS0 with withConsole=false: %s", args)
+	}
+
+	// Default RUST_LOG=warn must be injected when no env is provided.
+	if !strings.Contains(args, "ix.env.RUST_LOG=warn") {
+		t.Errorf("boot args missing default ix.env.RUST_LOG=warn: %s", args)
 	}
 }
 
@@ -194,7 +200,7 @@ func TestBuildKernelBootArgsSpecialChars(t *testing.T) {
 		"MSG=hello world", // value contains space
 		"EMPTY=",          // empty value
 	}
-	args := buildKernelBootArgs(env, nil)
+	args := buildKernelBootArgs(env, nil, false)
 
 	if !strings.Contains(args, "ix.env.FOO=bar=baz") {
 		t.Errorf("boot args missing ix.env.FOO=bar=baz: %s", args)
@@ -222,6 +228,38 @@ func TestVMDir(t *testing.T) {
 	}
 }
 
+func TestBuildKernelBootArgsConsoleGating(t *testing.T) {
+	quiet := buildKernelBootArgs(nil, nil, false)
+	if strings.Contains(quiet, "console=ttyS0") {
+		t.Errorf("console must be absent without IX_VM_CONSOLE: %s", quiet)
+	}
+	for _, want := range []string{"8250.nr_uarts=0", "quiet"} {
+		if !strings.Contains(quiet, want) {
+			t.Errorf("missing %q in quiet boot args: %s", want, quiet)
+		}
+	}
+
+	loud := buildKernelBootArgs(nil, nil, true)
+	if !strings.Contains(loud, "console=ttyS0") {
+		t.Errorf("console must be present with IX_VM_CONSOLE: %s", loud)
+	}
+}
+
+func TestBuildKernelBootArgsDefaultRustLog(t *testing.T) {
+	args := buildKernelBootArgs([]string{"FOO=bar"}, nil, false)
+	if !strings.Contains(args, "ix.env.RUST_LOG=warn") {
+		t.Errorf("expected default RUST_LOG=warn: %s", args)
+	}
+	// Caller-provided RUST_LOG wins.
+	args = buildKernelBootArgs([]string{"RUST_LOG=debug"}, nil, false)
+	if strings.Contains(args, "ix.env.RUST_LOG=warn") {
+		t.Errorf("default must not override caller RUST_LOG: %s", args)
+	}
+	if !strings.Contains(args, "ix.env.RUST_LOG=debug") {
+		t.Errorf("caller RUST_LOG missing: %s", args)
+	}
+}
+
 func TestBuildDriveSpec(t *testing.T) {
 	spec := buildDriveSpec("state", "/var/lib/ix/state.ext4", false)
 	if spec["drive_id"] != "state" {
@@ -243,5 +281,61 @@ func TestBuildDriveSpec(t *testing.T) {
 	}
 	if ro["is_root_device"] != false {
 		t.Errorf("is_root_device = %v, want false", ro["is_root_device"])
+	}
+}
+
+// TestCleanupTombstonesSocketDir: cleanup must fence the dir synchronously
+// (rename — the sandbox path is immediately reusable) and delete it shortly
+// after in the background.
+func TestCleanupTombstonesSocketDir(t *testing.T) {
+	base := t.TempDir()
+	sd := filepath.Join(base, "ix-tombtest")
+	if err := os.MkdirAll(sd, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sd, "scratch.ext4"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	fb := &firecrackerBackend{}
+	fb.cleanup(&VMMHandle{SocketDir: sd})
+
+	// Synchronous guarantee: the original path is gone the moment cleanup returns.
+	if _, err := os.Stat(sd); !os.IsNotExist(err) {
+		t.Errorf("socket dir still present after cleanup: %v", err)
+	}
+
+	// Caller-visible latency: rename is O(1); a synchronous RemoveAll of a
+	// populated dir is not. Populate with many files to make the difference
+	// observable, then require cleanup to return fast.
+	sd2 := filepath.Join(base, "ix-tombtest2")
+	if err := os.MkdirAll(sd2, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2000; i++ {
+		if err := os.WriteFile(filepath.Join(sd2, fmt.Sprintf("f%04d", i)), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	start := time.Now()
+	fb.cleanup(&VMMHandle{SocketDir: sd2})
+	if elapsed := time.Since(start); elapsed > 20*time.Millisecond {
+		t.Errorf("cleanup blocked %v — delete must be async", elapsed)
+	}
+
+	// Async guarantee: all tombstones disappear shortly after.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		entries, err := os.ReadDir(base)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(entries) == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("tombstone never deleted: %v", entries)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }

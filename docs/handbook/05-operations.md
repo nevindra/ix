@@ -402,9 +402,19 @@ If a sandbox fails three consecutive health checks, the monitor restarts it (kil
 
 When a pool VM is claimed (`mgr.Create()` grabs it), the manager immediately launches an async goroutine to create one replacement VM. The background `poolReplenisher` ticks every 1 second and fills up to `PoolSize` using up to `PoolWorkers` parallel goroutines. Pool creation counts toward `MaxConcurrent`.
 
+### Two-phase destroy
+
+`Destroy` returns after the *synchronous* phase: the VM process is killed, the TAP device is released, and the VM's directory is renamed to a tombstone (`ix-<id>.deleting.<n>`). The expensive part — deleting the per-VM scratch disk, a sparse file up to 10 GB — runs *asynchronously* after the call returns.
+
+Operational consequences:
+
+- **Disk reclaim is deferred.** Under heavy create/destroy churn, transient disk usage is higher than the live-VM count implies, because tombstones awaiting deletion still hold their scratch files. The reaper's disk-pressure check (5 GB threshold) can fire on tombstone backlog even when few VMs are running.
+- **Crashes leave tombstones.** If the process dies between the rename and the background `RemoveAll`, the tombstone directory survives. This is safe by design: tombstones keep the `ix-` prefix, so startup orphan recovery sweeps them (see below).
+- **The caller-visible latency win is workload-dependent.** For a freshly-created VM the scratch is nearly empty and `Destroy` was already dominated by process kill+wait (~25 ms). The two-phase design matters for VMs that *wrote* gigabytes to their scratch — that deletion no longer blocks the caller.
+
 ### Orphan recovery on startup
 
-`NewManager` scans `/tmp` for `ix-*` directories left over from a previous manager run and removes them. This prevents stale vsock sockets from accumulating across restarts. VM process recovery is not supported — orphaned VM processes are not re-adopted.
+`NewManager` scans the run directory for `ix-*` entries left over from a previous manager run and removes them — stale vsock socket dirs, interrupted-destroy tombstones (`ix-<id>.deleting.<n>`), and the scratch pre-copy pool (`ix-scratch-pool`, rebuilt on demand). This prevents stale sockets and orphaned scratch disks from accumulating across restarts. VM process recovery is not supported — orphaned VM processes are not re-adopted.
 
 ---
 
@@ -418,6 +428,8 @@ When a pool VM is claimed (`mgr.Create()` grabs it), the manager immediately lau
 | VM never becomes ready (create times out) | Kernel path wrong, vsock misconfigured, or `ixd` not in rootfs | Check `IX_KERNEL_PATH` points to a valid vmlinux; verify `ixd` is in the rootfs (`sudo mount -o loop /opt/ix/rootfs/base.ext4 /mnt && ls /mnt/usr/local/bin/ixd && sudo umount /mnt`); check Firecracker stderr by running it manually |
 | `browser_wait` returns 404 | Old `ixd` binary in rootfs (route added in newer daemon) | Rebuild the musl `ixd` binary, rebuild the `.ext4`, regenerate the golden snapshot |
 | `browser_eval` returns 403 `evaluate_disabled` | Old `PINCHTAB_CONFIG` with `allowEvaluate: false` (baked into an old `browser-vm.ext4`) | Rebuild `ix:browser-vm` Docker image and `browser-vm.ext4`; `browser-vm-init.sh` now writes `"allowEvaluate": true` in the config |
+| `browser_eval` returns 500 "failed to parse … response: error decoding response body" | Old `ixd` that required pinchtab's eval `result` to be a string; pinchtab returns the raw JSON value of the expression (`1+1` → `2`) | Rebuild `ixd` (fix lives in `ix-browser/src/eval.rs`), rebuild the rootfs, regenerate the golden snapshot |
+| `browser_screenshot`/`browser_pdf` intermittently 500 after ~30 s | Old timeout tie: pinchtab `actionSec` (30 s) raced the daemon's 30 s client timeout on slow cold-Chrome captures | Rebuild `ixd` AND `browser-vm.ext4` (chain is now pinchtab 60 s < gateway client 75 s < daemon capture timeout 90 s) |
 | Browser ops return 404 "tab not found" via gateway | Old Pinchtab binary that filtered out blank tabs | Rebuild `ix:browser-vm` with a fresh Pinchtab pull (`docker build --no-cache …`), rebuild `browser-vm.ext4` |
 | Browser ops return 503 "browser upstream unavailable" | Gateway's heartbeat has marked Pinchtab unhealthy; browser-tier VM is down or overloaded | `GET http://169.254.0.1:9100/health` from the host; check `GET /metrics` for in-flight count; check Firecracker process for the browser-tier VM is still running |
 | Browser ops return 503 in **local** mode (no gateway) | Chat VM was built with `base.ext4` but code expects a browser; Chrome / Pinchtab not in `base` tier | Use `browser.ext4` for VMs that need in-VM Chrome |

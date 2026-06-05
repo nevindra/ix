@@ -18,3 +18,4 @@ Thumbs.db
 codedb.snapshot
 rootfs/
 go-sdk/cmd/ix-vmm/ix-vmm
+go-sdk/bench-results/

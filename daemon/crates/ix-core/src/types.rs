@@ -8,6 +8,10 @@ pub struct ShellRequest {
     pub cwd: Option<String>,
     #[serde(default)]
     pub timeout: Option<u64>,
+    /// When set, the command runs in a persistent bash session keyed by this
+    /// id (state persists across calls). Absent = one-shot fork+exec.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 // Code execution

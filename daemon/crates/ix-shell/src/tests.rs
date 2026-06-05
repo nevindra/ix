@@ -71,6 +71,7 @@ mod tests {
             command: "echo hello".to_string(),
             cwd: None,
             timeout: None,
+            session_id: None,
         };
         let events = run_and_collect(req).await;
 
@@ -91,6 +92,7 @@ mod tests {
             command: "echo err_msg >&2".to_string(),
             cwd: None,
             timeout: None,
+            session_id: None,
         };
         let events = run_and_collect(req).await;
 
@@ -108,6 +110,7 @@ mod tests {
             command: "bash -c 'exit 42'".to_string(),
             cwd: None,
             timeout: None,
+            session_id: None,
         };
         let events = run_and_collect(req).await;
 
@@ -124,6 +127,7 @@ mod tests {
             command: "pwd".to_string(),
             cwd: Some(tmp_path.clone()),
             timeout: None,
+            session_id: None,
         };
         let events = run_and_collect(req).await;
 
@@ -152,6 +156,7 @@ mod tests {
             command: "sleep 999".to_string(),
             cwd: None,
             timeout: Some(1),
+            session_id: None,
         };
 
         // Allow up to 15 s total (1 s timeout + process teardown overhead).
@@ -176,6 +181,7 @@ mod tests {
             command: String::new(),
             cwd: None,
             timeout: None,
+            session_id: None,
         };
         let events = run_and_collect(req).await;
         assert!(
@@ -191,6 +197,7 @@ mod tests {
             command: "printf 'line1\nline2\nline3\n'".to_string(),
             cwd: None,
             timeout: None,
+            session_id: None,
         };
         let events = run_and_collect(req).await;
 
@@ -210,6 +217,7 @@ mod tests {
             command: "echo out1; echo err1 >&2; echo out2; echo err2 >&2".to_string(),
             cwd: None,
             timeout: None,
+            session_id: None,
         };
         let events = run_and_collect(req).await;
 
@@ -269,6 +277,123 @@ mod tests {
             !result.success(),
             "expected non-zero exit after SIGKILL, got: {:?}",
             result
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // session.rs tests
+    // ---------------------------------------------------------------------------
+
+    use crate::session::SessionManager;
+    use std::sync::Arc;
+
+    fn session_req(sid: &str, command: &str, timeout: Option<u64>) -> ShellRequest {
+        // Build via serde so the struct literal stays in one place.
+        serde_json::from_value(serde_json::json!({
+            "command": command,
+            "session_id": sid,
+            "timeout": timeout,
+        }))
+        .unwrap()
+    }
+
+    async fn run_in_session(mgr: &Arc<SessionManager>, req: ShellRequest) -> Vec<(String, String)> {
+        let (sender, rx) = test_channel(64);
+        mgr.execute(req, sender).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        collect_from_rx(rx).await
+    }
+
+    fn stdout_text(events: &[(String, String)]) -> String {
+        events_of_type(events, "stdout")
+            .iter()
+            .map(|d| {
+                serde_json::from_str::<serde_json::Value>(d).unwrap()["text"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[tokio::test]
+    async fn session_state_persists_across_commands() {
+        let mgr = SessionManager::new_shared();
+        run_in_session(&mgr, session_req("s1", "X=42", None)).await;
+        let events = run_in_session(&mgr, session_req("s1", "echo $X", None)).await;
+        assert_eq!(stdout_text(&events), "42");
+        let complete = complete_event(&events).expect("complete event");
+        assert_eq!(complete["exit_code"], 0);
+    }
+
+    #[tokio::test]
+    async fn sessions_are_isolated_from_each_other() {
+        let mgr = SessionManager::new_shared();
+        run_in_session(&mgr, session_req("a", "X=aaa", None)).await;
+        let events = run_in_session(&mgr, session_req("b", "echo \"X=[$X]\"", None)).await;
+        assert_eq!(stdout_text(&events), "X=[]");
+    }
+
+    #[tokio::test]
+    async fn session_reports_nonzero_exit_code() {
+        let mgr = SessionManager::new_shared();
+        let events = run_in_session(&mgr, session_req("s1", "false", None)).await;
+        let complete = complete_event(&events).expect("complete event");
+        assert_eq!(complete["exit_code"], 1);
+    }
+
+    #[tokio::test]
+    async fn session_captures_stderr() {
+        let mgr = SessionManager::new_shared();
+        let events = run_in_session(&mgr, session_req("s1", "echo oops >&2", None)).await;
+        let errs = events_of_type(&events, "stderr");
+        assert!(
+            errs.iter().any(|d| d.contains("oops")),
+            "stderr missing: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_handles_output_without_trailing_newline() {
+        let mgr = SessionManager::new_shared();
+        let events = run_in_session(&mgr, session_req("s1", "printf no-newline", None)).await;
+        assert_eq!(stdout_text(&events), "no-newline");
+    }
+
+    #[tokio::test]
+    async fn session_timeout_kills_and_recreates() {
+        let mgr = SessionManager::new_shared();
+        let events = run_in_session(&mgr, session_req("s1", "sleep 5", Some(1))).await;
+        assert!(error_event(&events).is_some(), "expected timeout error");
+        // Session must be recreated transparently on the next command.
+        let events = run_in_session(&mgr, session_req("s1", "echo back", None)).await;
+        assert_eq!(stdout_text(&events), "back");
+    }
+
+    #[tokio::test]
+    async fn session_survives_user_exit_by_recreating() {
+        let mgr = SessionManager::new_shared();
+        run_in_session(&mgr, session_req("s1", "exit 0", None)).await;
+        let events = run_in_session(&mgr, session_req("s1", "echo alive", None)).await;
+        assert_eq!(stdout_text(&events), "alive");
+    }
+
+    #[tokio::test]
+    async fn session_is_fast_after_first_command() {
+        let mgr = SessionManager::new_shared();
+        run_in_session(&mgr, session_req("s1", "true", None)).await; // pays bash -l once
+        let t = std::time::Instant::now();
+        let (sender, rx) = test_channel(64);
+        mgr.execute(session_req("s1", "echo hot", None), sender).await;
+        let elapsed = t.elapsed();
+        drop(rx);
+        // In-guest persistent round-trip must stay well below the ~18 ms
+        // fork+exec it guards against; 15 ms keeps that margin while tolerating
+        // loaded/contended CI runners that briefly stall the reactor.
+        assert!(
+            elapsed < Duration::from_millis(15),
+            "session round-trip took {elapsed:?}"
         );
     }
 }

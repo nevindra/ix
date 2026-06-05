@@ -51,6 +51,12 @@ type ManagerConfig struct {
 	BrowserStateImage string // optional ext4 state disk attached to the browser-tier VM; empty = ephemeral
 	GatewayListenAddr string // host addr the gateway binds, reachable from guests via their per-VM TAP route; default "169.254.0.1:9100"
 	GatewayToken      string // optional bearer token forwarded to pinchtab and required from daemons
+	// BrowserTrustedResolveCIDRs opts specific private/internal CIDRs back in
+	// past pinchtab's SSRF navigation guard (security.trustedResolveCIDRs in
+	// the guest config). Default empty = guard fully on. Benchmark/test use:
+	// the browser benchmarks serve their hermetic page on the gateway's
+	// link-local IP, which the guard would otherwise 403.
+	BrowserTrustedResolveCIDRs []string
 
 	// Networking (per-VM TAP + host NAT).
 	EgressInterface   string // optional: restrict NAT MASQUERADE to this uplink; empty = masquerade on any non-TAP egress (robust default for multi-homed/VPN hosts)
@@ -156,6 +162,10 @@ type IXManager struct {
 	pool     []*poolEntry  // pre-warmed VMs ready to be claimed
 	poolMu   sync.Mutex    // guards pool slice
 	poolStop chan struct{} // signals pool replenisher to stop
+
+	// poolHits counts Create() calls served from the pre-warmed pool.
+	// Benchmarks use it to fail loudly instead of silently timing a cold boot.
+	poolHits atomic.Int64
 
 	tier *browserTier // shared browser-tier VM + gateway (nil when BrowserMode != "remote")
 }
@@ -354,6 +364,8 @@ func (m *IXManager) Create(ctx context.Context, opts sandbox.CreateOpts) (sandbo
 			"kernelsReady", entry.kernelsReady,
 		)
 
+		m.poolHits.Add(1)
+
 		// Trigger async replenishment.
 		go m.replenishPool()
 
@@ -493,6 +505,10 @@ func (m *IXManager) Close() error {
 	for _, entry := range poolEntries {
 		m.vmm.cleanup(entry.vmm)
 		m.releaseSlot()
+	}
+
+	if m.vmm != nil && m.vmm.snapshot != nil {
+		m.vmm.snapshot.StopScratchPool()
 	}
 
 	m.tier.stop(m.vmm)

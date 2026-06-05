@@ -9,6 +9,12 @@ use ix_core::{Error, Result};
 const SENTINEL_END: &str = "__IX_END__";
 const SENTINEL_RESULT: &str = "__IX_RESULT__";
 
+/// Ceiling applied when a request carries no timeout: execution is meant to
+/// be interactive, and an unbounded wait can wedge the kernel forever if user
+/// code closes one of the std streams (the concurrent sentinel reads then
+/// never both complete). 10 minutes is far above any sane interactive cell.
+const DEFAULT_EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
 pub struct Kernel {
     pub language: String,
     pub process: Child,
@@ -21,11 +27,16 @@ pub struct Kernel {
 impl Kernel {
     pub async fn start(language: &str) -> Result<Self> {
         let (cmd_path, args) = language_command(language)?;
+        Self::start_with_command(language, &cmd_path, &args).await
+    }
 
+    /// Start a kernel with an explicit command. Lets unit tests run the
+    /// repo-local repl.py instead of the image-baked /usr/lib/ix/repl.py.
+    pub async fn start_with_command(language: &str, cmd_path: &str, args: &[String]) -> Result<Self> {
         info!(language, cmd = %cmd_path, "starting REPL kernel");
 
-        let mut child = Command::new(&cmd_path)
-            .args(&args)
+        let mut child = Command::new(cmd_path)
+            .args(args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -84,14 +95,22 @@ impl Kernel {
             .await
             .map_err(|e| Error::Internal(format!("flush stdin: {e}")))?;
 
-        // Read stdout until sentinel
-        let read_future = async {
+        // Read stdout and stderr concurrently, each until its own sentinel
+        // (the REPL writes __IX_RESULT__ to BOTH streams after every cell).
+        // Concurrent reads prevent a pipe-buffer deadlock when a cell writes
+        // >64 KB to one stream. A default ceiling (DEFAULT_EXEC_TIMEOUT) is
+        // always applied so that a request with no timeout cannot hang forever
+        // if user code closes one of the std streams before emitting the
+        // sentinel (the sibling future would otherwise wait indefinitely).
+        let stdout = &mut self.stdout;
+        let stderr = &mut self.stderr;
+
+        let stdout_future = async {
             let mut output = String::new();
             let mut line = String::new();
             loop {
                 line.clear();
-                let n = self
-                    .stdout
+                let n = stdout
                     .read_line(&mut line)
                     .await
                     .map_err(|e| Error::Internal(format!("read stdout: {e}")))?;
@@ -106,34 +125,33 @@ impl Kernel {
             Ok::<String, Error>(output)
         };
 
-        let stdout_output = if let Some(dur) = timeout {
-            match tokio::time::timeout(dur, read_future).await {
-                Ok(result) => result?,
-                Err(_) => return Err(Error::Internal("code execution timed out".into())),
+        let stderr_future = async {
+            let mut output = String::new();
+            let mut line = String::new();
+            loop {
+                line.clear();
+                let n = stderr
+                    .read_line(&mut line)
+                    .await
+                    .map_err(|e| Error::Internal(format!("read stderr: {e}")))?;
+                if n == 0 {
+                    break; // REPL closed stderr — return what we have
+                }
+                if line.trim_end() == SENTINEL_RESULT {
+                    break;
+                }
+                output.push_str(&line);
             }
-        } else {
-            read_future.await?
+            Ok::<String, Error>(output)
         };
 
-        // Drain any available stderr (non-blocking)
-        let mut stderr_output = String::new();
-        let mut stderr_line = String::new();
-        loop {
-            // Use a very short timeout to drain available stderr without blocking
-            match tokio::time::timeout(
-                std::time::Duration::from_millis(10),
-                self.stderr.read_line(&mut stderr_line),
-            )
-            .await
-            {
-                Ok(Ok(0)) | Err(_) => break,
-                Ok(Ok(_)) => {
-                    stderr_output.push_str(&stderr_line);
-                    stderr_line.clear();
-                }
-                Ok(Err(_)) => break,
-            }
-        }
+        let joined = async { tokio::join!(stdout_future, stderr_future) };
+
+        let dur = timeout.unwrap_or(DEFAULT_EXEC_TIMEOUT);
+        let (stdout_output, stderr_output) = match tokio::time::timeout(dur, joined).await {
+            Ok((o, e)) => (o?, e?),
+            Err(_) => return Err(Error::Internal("code execution timed out".into())),
+        };
 
         Ok((stdout_output, stderr_output))
     }
@@ -186,6 +204,7 @@ rl.on('line', line => {
             console.error(e.stack || e.message || e);
         }
         process.stdout.write('__IX_RESULT__\n');
+        process.stderr.write('__IX_RESULT__\n');
     } else {
         lines.push(line);
     }
@@ -215,6 +234,8 @@ while True:
         if r.stderr: sys.stderr.write(r.stderr)
     sys.stdout.write('__IX_RESULT__\n')
     sys.stdout.flush()
+    sys.stderr.write('__IX_RESULT__\n')
+    sys.stderr.flush()
 "#
                 .into(),
             ],
@@ -232,6 +253,56 @@ pub(crate) fn language_to_command(lang: &str) -> Result<(String, Vec<String>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // Kernel integration helpers
+    // -----------------------------------------------------------------------
+
+    async fn start_local_python() -> Kernel {
+        let repl = concat!(env!("CARGO_MANIFEST_DIR"), "/src/ix_repl.py");
+        Kernel::start_with_command("python", "python3", &["-u".into(), repl.into()])
+            .await
+            .expect("python3 must be installed to run ix-code tests")
+    }
+
+    #[tokio::test]
+    async fn stderr_is_captured_and_does_not_cost_a_drain_timeout() {
+        let mut k = start_local_python().await;
+        let timeout = Some(std::time::Duration::from_secs(10));
+        // Warm up: first execute absorbs interpreter startup.
+        k.execute("x = 1", timeout).await.unwrap();
+
+        let t = std::time::Instant::now();
+        let (out, err) = k
+            .execute("import sys; sys.stderr.write('boom\\n')", timeout)
+            .await
+            .unwrap();
+        let elapsed = t.elapsed();
+
+        assert!(err.contains("boom"), "stderr lost: {err:?}");
+        assert!(out.is_empty(), "unexpected stdout: {out:?}");
+        // The old protocol drained stderr with a fixed 10 ms timeout on every
+        // execute. A warm one-liner must come in far below that.
+        assert!(
+            elapsed < std::time::Duration::from_millis(8),
+            "execute took {elapsed:?} — stderr drain timeout is back?"
+        );
+    }
+
+    #[tokio::test]
+    async fn stdout_and_stderr_both_captured_in_one_cell() {
+        let mut k = start_local_python().await;
+        let timeout = Some(std::time::Duration::from_secs(10));
+        let (out, err) = k
+            .execute(
+                "import sys\nprint('to-out')\nsys.stderr.write('to-err\\n')",
+                timeout,
+            )
+            .await
+            .unwrap();
+        assert!(out.contains("to-out"), "stdout: {out:?}");
+        assert!(err.contains("to-err"), "stderr: {err:?}");
+    }
 
     // -----------------------------------------------------------------------
     // normalize_language

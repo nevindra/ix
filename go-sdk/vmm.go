@@ -63,6 +63,9 @@ func buildDriveSpec(id, pathOnHost string, readOnly bool) driveSpec {
 // CIDs 0-2 are reserved (VMADDR_CID_ANY, VMADDR_CID_HYPERVISOR, VMADDR_CID_HOST).
 var cidCounter atomic.Uint32
 
+// tombstoneCounter disambiguates concurrent tombstones for the same dir name.
+var tombstoneCounter atomic.Uint64
+
 func init() {
 	cidCounter.Store(2) // next allocation returns 3
 }
@@ -75,10 +78,21 @@ func allocateCID() uint32 {
 // buildKernelBootArgs constructs the kernel command line for the Firecracker VM.
 // Environment variables from envSlice are injected as ix.env.KEY=VALUE entries
 // so the ix-init script can read them from /proc/cmdline. When net is non-nil,
-// an ip= argument autoconfigures eth0 (IP, gateway, /30 mask, DNS) at boot.
-func buildKernelBootArgs(envSlice []string, net *vmNet) string {
-	parts := []string{
-		"console=ttyS0",
+// an ip= argument autoconfigures eth0 at boot.
+//
+// withConsole routes the guest serial console to Firecracker stdout (set
+// IX_VM_CONSOLE=1 on the host). Default is OFF: every serial byte is an
+// emulated-UART vmexit, so console output taxes both boot time and any guest
+// process that logs to stdout. 8250.nr_uarts=0 removes the serial driver
+// entirely; quiet suppresses printk to the (absent) console.
+func buildKernelBootArgs(envSlice []string, net *vmNet, withConsole bool) string {
+	var parts []string
+	if withConsole {
+		parts = append(parts, "console=ttyS0")
+	} else {
+		parts = append(parts, "8250.nr_uarts=0", "quiet")
+	}
+	parts = append(parts,
 		"reboot=k",
 		"panic=1",
 		"pci=off",
@@ -89,16 +103,24 @@ func buildKernelBootArgs(envSlice []string, net *vmNet) string {
 		"i8042.nopnp",
 		"i8042.dumbkbd",
 		"root=/dev/vda",
-		"ro", // the rootfs is one shared image for all VMs — writes go to the per-VM scratch disk via overlayfs (see ix-stage0)
+		"ro", // shared rootfs: all writes go to the per-VM scratch via overlayfs (ix-stage0)
 		"init=/sbin/ix-stage0",
-	}
+	)
 	if net != nil {
-		// ip=<client>:<server>:<gw>:<mask>:<host>:<dev>:<autoconf>:<dns>
 		parts = append(parts, fmt.Sprintf(
 			"ip=%s::%s:%s::eth0:off:8.8.8.8", net.guestIP, net.hostIP, net.mask))
 	}
+	hasRustLog := false
 	for _, e := range envSlice {
+		if strings.HasPrefix(e, "RUST_LOG=") {
+			hasRustLog = true
+		}
 		parts = append(parts, "ix.env."+e)
+	}
+	if !hasRustLog {
+		// ixd logs at info per request; with the console wired to an emulated
+		// UART that is measurable per-op latency. warn keeps real problems.
+		parts = append(parts, "ix.env.RUST_LOG=warn")
 	}
 	return strings.Join(parts, " ")
 }
@@ -166,12 +188,14 @@ func (fb *firecrackerBackend) startVMCold(ctx context.Context, sandboxID string,
 	// Per-VM scratch disk: every VM gets a private writable ext4 copied from
 	// the empty template. The rootfs itself is attached read-only below — the
 	// guest writes only to this scratch via overlayfs (ix-stage0).
+	tScratch := time.Now()
 	if fb.scratchTemplate != "" {
 		if err := copySparse(fb.scratchTemplate, filepath.Join(socketDir, scratchFileName)); err != nil {
 			_ = os.RemoveAll(socketDir)
 			return nil, fmt.Errorf("create scratch disk: %w", err)
 		}
 	}
+	tracePhase(fb.logger, "coldboot", "scratch", tScratch)
 
 	apiSocket := filepath.Join(socketDir, "fc.sock")
 	vsockUDS := filepath.Join(socketDir, "vsock.uds")
@@ -180,6 +204,7 @@ func (fb *firecrackerBackend) startVMCold(ctx context.Context, sandboxID string,
 	// tear the tap down and release its index, so track them for the closure.
 	var vn *vmNet
 	if !fb.disableNet && !forceNoNet {
+		tTap := time.Now()
 		if fb.tapAlloc == nil {
 			_ = os.RemoveAll(socketDir)
 			return nil, fmt.Errorf("networking enabled but tap allocator not configured")
@@ -196,6 +221,7 @@ func (fb *firecrackerBackend) startVMCold(ctx context.Context, sandboxID string,
 			return nil, fmt.Errorf("setup tap: %w", err)
 		}
 		vn = &net
+		tracePhase(fb.logger, "coldboot", "tap", tTap)
 	}
 
 	// cleanupOnErr undoes everything created so far. Call on every error path
@@ -227,19 +253,24 @@ func (fb *firecrackerBackend) startVMCold(ctx context.Context, sandboxID string,
 		cmd.Stderr = os.Stderr
 	}
 
+	tSpawn := time.Now()
 	if err := cmd.Start(); err != nil {
 		cleanupOnErr(nil)
 		return nil, fmt.Errorf("start firecracker: %w", err)
 	}
+	tracePhase(fb.logger, "coldboot", "spawn", tSpawn)
 
+	tAPISock := time.Now()
 	if err := waitForFile(apiSocket, 5*time.Second); err != nil {
 		cleanupOnErr(cmd.Process)
 		return nil, fmt.Errorf("firecracker API socket not ready: %w", err)
 	}
+	tracePhase(fb.logger, "coldboot", "apisock", tAPISock)
 
 	apiClient := fcAPIClient(apiSocket)
-	bootArgs := buildKernelBootArgs(envSlice, vn)
+	bootArgs := buildKernelBootArgs(envSlice, vn, os.Getenv("IX_VM_CONSOLE") != "")
 
+	tConfig := time.Now()
 	if err := fcPut(ctx, apiClient, "/boot-source", map[string]any{
 		"kernel_image_path": fb.kernelPath,
 		"boot_args":         bootArgs,
@@ -313,13 +344,16 @@ func (fb *firecrackerBackend) startVMCold(ctx context.Context, sandboxID string,
 		cleanupOnErr(cmd.Process)
 		return nil, fmt.Errorf("set vsock: %w", err)
 	}
+	tracePhase(fb.logger, "coldboot", "config", tConfig)
 
+	tInstanceStart := time.Now()
 	if err := fcPut(ctx, apiClient, "/actions", map[string]any{
 		"action_type": "InstanceStart",
 	}); err != nil {
 		cleanupOnErr(cmd.Process)
 		return nil, fmt.Errorf("start VM instance: %w", err)
 	}
+	tracePhase(fb.logger, "coldboot", "instancestart", tInstanceStart)
 
 	return &VMMHandle{
 		Process:   cmd.Process,
@@ -350,7 +384,24 @@ func (fb *firecrackerBackend) cleanup(handle *VMMHandle) {
 		}
 	}
 	if handle.SocketDir != "" {
-		_ = os.RemoveAll(handle.SocketDir)
+		// Two-phase destroy: synchronously rename the dir to a tombstone so
+		// the sandbox path is fenced (no new VM can collide with stale files),
+		// then delete in the background. Same total IO, off the caller's
+		// latency path. Trade-offs (documented in BENCHMARKS.md v0.7):
+		//   - disk reclaim lags by ms-to-seconds under churn (ENOSPC window
+		//     on a nearly-full host; the reaper's disk-pressure path remains
+		//     the backstop)
+		//   - "Destroy returned" no longer implies "disk clean"; a manager
+		//     crash can orphan tombstones — recover() sweeps ix-* dirs
+		//     (tombstones keep the ix- prefix) at startup.
+		tomb := fmt.Sprintf("%s.deleting.%d", handle.SocketDir, tombstoneCounter.Add(1))
+		if err := os.Rename(handle.SocketDir, tomb); err != nil {
+			// Rename failed (already gone, cross-device, ...) — fall back to
+			// the old synchronous delete rather than leak.
+			_ = os.RemoveAll(handle.SocketDir)
+			return
+		}
+		go func() { _ = os.RemoveAll(tomb) }()
 	}
 }
 

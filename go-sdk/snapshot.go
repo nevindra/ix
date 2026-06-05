@@ -34,6 +34,18 @@ type SnapshotManager struct {
 
 	mu    sync.Mutex
 	ready bool
+
+	// scratchPool holds clone-ready copies of the golden scratch. Restore
+	// renames one in (~µs) instead of paying a cp fork+exec on the hot path.
+	//
+	// Concurrency discipline: scratchPool and poolStop are assigned once under
+	// mu in startScratchPool and never changed afterwards. takePooledScratch
+	// reads them under mu then operates on the local copy. StopScratchPool
+	// closes poolStop idempotently via poolStopOnce. The filler goroutine
+	// closes over local copies of the channels so it never touches sm fields.
+	scratchPool  chan string
+	poolStop     chan struct{}
+	poolStopOnce sync.Once
 }
 
 // NewSnapshotManager constructs a SnapshotManager. The manager is not ready
@@ -185,6 +197,8 @@ func (sm *SnapshotManager) CreateGolden(ctx context.Context) error {
 	sm.ready = true
 	sm.mu.Unlock()
 
+	sm.startScratchPool()
+
 	return nil
 }
 
@@ -215,10 +229,17 @@ func (sm *SnapshotManager) Restore(ctx context.Context, sandboxID string) (*VMMH
 	// this clone its own scratch: a byte-identical copy of the golden VM's
 	// scratch at pause time, at the relative path recorded in snapshot.state
 	// (Firecracker re-resolves "scratch.ext4" against this process's cwd).
-	if err := copySparse(sm.scratchGoldenPath(), filepath.Join(socketDir, scratchFileName)); err != nil {
-		_ = os.RemoveAll(socketDir)
-		return nil, fmt.Errorf("create clone scratch: %w", err)
+	t := time.Now()
+	// Per-clone scratch: prefer a pre-copied pool entry (rename, ~µs); fall
+	// back to a sparse copy when the pool is empty.
+	scratchDst := filepath.Join(socketDir, scratchFileName)
+	if !sm.takePooledScratch(scratchDst) {
+		if err := copySparse(sm.scratchGoldenPath(), scratchDst); err != nil {
+			_ = os.RemoveAll(socketDir)
+			return nil, fmt.Errorf("create clone scratch: %w", err)
+		}
 	}
+	tracePhase(sm.logger, "restore", "scratch", t)
 
 	apiSocket := filepath.Join(socketDir, "fc.sock")
 	vsockUDS := filepath.Join(socketDir, "vsock.uds")
@@ -232,17 +253,21 @@ func (sm *SnapshotManager) Restore(ctx context.Context, sandboxID string) (*VMMH
 	cmd.Stdout = nil
 	cmd.Stderr = nil
 
+	t = time.Now()
 	if err := cmd.Start(); err != nil {
 		_ = os.RemoveAll(socketDir)
 		return nil, fmt.Errorf("start firecracker: %w", err)
 	}
+	tracePhase(sm.logger, "restore", "spawn", t)
 
 	// Wait for the API socket before sending commands.
+	t = time.Now()
 	if err := waitForFile(apiSocket, 5*time.Second); err != nil {
 		_ = cmd.Process.Kill()
 		_ = os.RemoveAll(socketDir)
 		return nil, fmt.Errorf("firecracker API socket not ready: %w", err)
 	}
+	tracePhase(sm.logger, "restore", "apisock", t)
 
 	apiClient := fcAPIClient(apiSocket)
 
@@ -250,6 +275,7 @@ func (sm *SnapshotManager) Restore(ctx context.Context, sandboxID string) (*VMMH
 
 	// Load the snapshot; resume_vm:true means Firecracker starts the VM
 	// immediately after loading.
+	t = time.Now()
 	if err := fcPut(ctx, apiClient, "/snapshot/load", map[string]any{
 		"snapshot_path": sm.statePath(),
 		"mem_backend": map[string]any{
@@ -262,6 +288,7 @@ func (sm *SnapshotManager) Restore(ctx context.Context, sandboxID string) (*VMMH
 		_ = os.RemoveAll(socketDir)
 		return nil, fmt.Errorf("load snapshot: %w", err)
 	}
+	tracePhase(sm.logger, "restore", "load", t)
 
 	// Build an HTTP client that talks to the guest daemon via vsock transport.
 	// The daemon was running when the snapshot was taken, so it comes up
@@ -270,11 +297,13 @@ func (sm *SnapshotManager) Restore(ctx context.Context, sandboxID string) (*VMMH
 		Transport: vsockTransport(vsockUDS),
 		Timeout:   2 * time.Second,
 	}
+	t = time.Now()
 	if err := waitHealthy(ctx, guestHTTP); err != nil {
 		_ = cmd.Process.Kill()
 		_ = os.RemoveAll(socketDir)
 		return nil, fmt.Errorf("guest daemon health check failed: %w", err)
 	}
+	tracePhase(sm.logger, "restore", "health", t)
 
 	sm.logger.Info("snapshot: restore complete", "sandbox", sandboxID)
 
@@ -285,6 +314,137 @@ func (sm *SnapshotManager) Restore(ctx context.Context, sandboxID string) (*VMMH
 		APISocket: apiSocket,
 		CID:       0, // not used for snapshot clones
 	}, nil
+}
+
+// scratchPoolSize is how many clone-ready scratch copies are kept warm.
+const scratchPoolSize = 4
+
+// startScratchPool launches the background filler. Idempotent per manager:
+// CreateGolden calls it once the golden scratch exists.
+//
+// The pool directory is placed under the backend's runDir so pool files live
+// on the same filesystem as the per-VM scratch destinations (runDir/ix-<id>/).
+// os.Rename across filesystems always fails with EXDEV; same-filesystem means
+// the rename is atomic and sub-millisecond. The ix-scratch-pool prefix is
+// intentional: the manager's recover() sweep (reaper.go) removes orphaned
+// ix-* dirs under runDir, so stale pool files are cleaned up after a crash.
+//
+// Channel assignments are made under mu once, then never changed. The filler
+// goroutine closes over LOCAL copies of the channels so it never reads sm
+// fields after startup — this is the key discipline that prevents data races.
+func (sm *SnapshotManager) startScratchPool() {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	if sm.scratchPool != nil {
+		return // already started
+	}
+
+	// Derive pool dir from backend.runDir to guarantee same-filesystem renames.
+	// Fall back to snapshotDir when backend is nil (unit-test ergonomics).
+	var base string
+	if sm.backend != nil && sm.backend.runDir != "" {
+		base = sm.backend.runDir
+	} else {
+		base = sm.snapshotDir
+	}
+	poolDir := filepath.Join(base, "ix-scratch-pool")
+	if err := os.MkdirAll(poolDir, 0o700); err != nil {
+		sm.logger.Warn("scratch pool: failed to create pool dir, pool disabled", "error", err)
+		return
+	}
+
+	// Create channels as locals, assign to fields, pass locals to goroutine.
+	// The goroutine NEVER reads sm.scratchPool or sm.poolStop — only the locals.
+	pool := make(chan string, scratchPoolSize)
+	stop := make(chan struct{})
+	sm.scratchPool = pool
+	sm.poolStop = stop
+
+	goldenPath := sm.scratchGoldenPath() // capture under lock; immutable after CreateGolden
+
+	go func() {
+		for i := 0; ; i++ {
+			// Check for stop before each copy to exit promptly.
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			p := filepath.Join(poolDir, fmt.Sprintf("scratch.pool.%d.ext4", i))
+			if err := copySparse(goldenPath, p); err != nil {
+				sm.logger.Warn("scratch pool copy failed", "error", err)
+				select {
+				case <-stop:
+					return
+				case <-time.After(time.Second):
+				}
+				continue
+			}
+			select {
+			case pool <- p:
+			case <-stop:
+				_ = os.Remove(p)
+				return
+			}
+		}
+	}()
+}
+
+// StopScratchPool stops the filler and removes unconsumed pool files.
+// Idempotent: safe to call multiple times; poolStopOnce ensures close is
+// never repeated. Reads sm fields under mu into locals before operating.
+func (sm *SnapshotManager) StopScratchPool() {
+	sm.mu.Lock()
+	pool := sm.scratchPool
+	stop := sm.poolStop
+	sm.mu.Unlock()
+
+	if stop == nil {
+		return // pool was never started
+	}
+
+	// Use poolStopOnce so concurrent or repeated StopScratchPool calls cannot
+	// double-close the channel (which would panic with "close of closed channel").
+	sm.poolStopOnce.Do(func() { close(stop) })
+
+	// Drain unconsumed pool files and remove them. pool is a buffered channel;
+	// after close(stop) the filler will not send any more entries, so this loop
+	// terminates once the buffer is empty.
+	for {
+		select {
+		case p := <-pool:
+			_ = os.Remove(p)
+		default:
+			return
+		}
+	}
+}
+
+// takePooledScratch moves one pre-copied scratch into dst. False = pool
+// empty or disabled; the caller falls back to copySparse.
+//
+// Reads sm.scratchPool under mu into a local, then operates on the local —
+// this avoids a race with StopScratchPool which also reads the field.
+func (sm *SnapshotManager) takePooledScratch(dst string) bool {
+	sm.mu.Lock()
+	pool := sm.scratchPool
+	sm.mu.Unlock()
+
+	if pool == nil {
+		return false
+	}
+	select {
+	case p := <-pool:
+		if err := os.Rename(p, dst); err != nil {
+			sm.logger.Warn("scratch pool rename failed; falling back to copy", "error", err)
+			_ = os.Remove(p)
+			return false
+		}
+		return true
+	default:
+		return false
+	}
 }
 
 // waitHealthy polls GET /health until the guest daemon responds with HTTP 200,
@@ -300,33 +460,34 @@ func waitHealthy(ctx context.Context, httpClient *http.Client) error {
 // cold-start can exceed the snapshot-restore 10 s budget.
 func waitHealthyAuth(ctx context.Context, httpClient *http.Client, bearer string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
-	ticker := time.NewTicker(10 * time.Millisecond)
+	ticker := time.NewTicker(1 * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-			if time.Now().After(deadline) {
-				return fmt.Errorf("guest daemon health check timed out after %s", timeout)
-			}
-			req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://localhost/health", nil)
-			if err != nil {
-				return fmt.Errorf("build health request: %w", err)
-			}
-			if bearer != "" {
-				req.Header.Set("Authorization", "Bearer "+bearer)
-			}
-			resp, err := httpClient.Do(req)
-			if err != nil {
-				// Daemon not up yet — keep polling.
-				continue
-			}
+		// Probe immediately — a snapshot-restored daemon is usually already
+		// serving, so waiting a tick before the first probe is pure latency.
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://localhost/health", nil)
+		if err != nil {
+			return fmt.Errorf("build health request: %w", err)
+		}
+		if bearer != "" {
+			req.Header.Set("Authorization", "Bearer "+bearer)
+		}
+		resp, err := httpClient.Do(req)
+		if err == nil {
 			resp.Body.Close()
 			if resp.StatusCode == http.StatusOK {
 				return nil
 			}
+		}
+
+		if time.Now().After(deadline) {
+			return fmt.Errorf("guest daemon health check timed out after %s", timeout)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
 		}
 	}
 }

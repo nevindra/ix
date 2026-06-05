@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // ixClient is a thin HTTP client for the ix daemon REST + SSE API.
@@ -103,8 +104,11 @@ func (c *ixClient) getRaw(ctx context.Context, path string) (io.ReadCloser, erro
 		return nil, fmt.Errorf("request %s: %w", path, err)
 	}
 	if resp.StatusCode >= 400 {
+		// Include the error body: for raw-byte routes (screenshot/pdf) it is
+		// the only diagnostic the daemon sends.
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
 		resp.Body.Close()
-		return nil, fmt.Errorf("request %s: HTTP %d", path, resp.StatusCode)
+		return nil, fmt.Errorf("request %s: HTTP %d: %s", path, resp.StatusCode, respBody)
 	}
 	return resp.Body, nil
 }
@@ -216,8 +220,25 @@ func (r *sseReader) Data() string { return r.data }
 // Err returns any error encountered during scanning.
 func (r *sseReader) Err() error { return r.err }
 
-// Close closes the underlying response body and stops the context watcher.
+// Close finishes the SSE body and releases the connection.
+//
+// It drains to EOF first (bounded): the daemon ends the stream right after
+// the terminal event, so the drain normally reads zero bytes and lets the
+// HTTP/1.1 keep-alive pool reuse the connection. Closing without reaching
+// EOF would discard the connection and force a fresh vsock dial + CONNECT
+// handshake on the next request.
 func (r *sseReader) Close() error {
+	done := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(io.Discard, io.LimitReader(r.body, 64<<10))
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(100 * time.Millisecond):
+		// Stream still open (e.g. abandoning a long-running command mid-way):
+		// give up on reuse and hard-close below.
+	}
 	r.cancel()
 	return r.body.Close()
 }

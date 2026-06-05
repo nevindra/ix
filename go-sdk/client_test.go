@@ -1,13 +1,19 @@
 package ix
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestClientPost(t *testing.T) {
@@ -99,6 +105,29 @@ func TestClientGetRaw(t *testing.T) {
 	}
 	if string(got) != want {
 		t.Errorf("expected %q, got %q", want, string(got))
+	}
+}
+
+func TestClientGetRawError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`{"error":"internal error: gateway request failed: timed out"}`))
+	}))
+	defer srv.Close()
+
+	c := newClient(srv.URL, srv.Client())
+
+	_, err := c.getRaw(context.Background(), "/v1/browser/screenshot")
+	if err == nil {
+		t.Fatal("expected error for HTTP 500, got nil")
+	}
+	if !strings.Contains(err.Error(), "HTTP 500") {
+		t.Errorf("error should mention HTTP 500, got: %v", err)
+	}
+	// The daemon's error body is the only diagnostic for raw-byte routes
+	// (screenshot/pdf) — discarding it made the v0.7 bench failure unreadable.
+	if !strings.Contains(err.Error(), "gateway request failed") {
+		t.Errorf("error should include response body, got: %v", err)
 	}
 }
 
@@ -273,5 +302,151 @@ func TestSSEReaderPingOnly(t *testing.T) {
 
 	if reader.Next() {
 		t.Error("expected false for ping-only stream")
+	}
+}
+
+// fakeVsockProxy speaks the Firecracker vsock UDS handshake
+// ("CONNECT <port>\n" -> "OK <port>\n") and then serves HTTP on the
+// connection, counting dials so tests can assert keep-alive reuse.
+type fakeVsockProxy struct {
+	dials atomic.Int64
+}
+
+type chanListener struct {
+	ch     chan net.Conn
+	addr   net.Addr
+	closed chan struct{}
+}
+
+func (l *chanListener) Accept() (net.Conn, error) {
+	select {
+	case c, ok := <-l.ch:
+		if !ok {
+			return nil, net.ErrClosed
+		}
+		return c, nil
+	case <-l.closed:
+		return nil, net.ErrClosed
+	}
+}
+func (l *chanListener) Close() error {
+	select {
+	case <-l.closed:
+		// already closed
+	default:
+		close(l.closed)
+	}
+	return nil
+}
+func (l *chanListener) Addr() net.Addr { return l.addr }
+
+// bufferedConn replays bytes the handshake reader already buffered.
+type bufferedConn struct {
+	net.Conn
+	r *bufio.Reader
+}
+
+func (c *bufferedConn) Read(b []byte) (int, error) { return c.r.Read(b) }
+
+func startFakeVsockProxy(t *testing.T, sockPath string, handler http.Handler) *fakeVsockProxy {
+	t.Helper()
+	p := &fakeVsockProxy{}
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+
+	httpConns := &chanListener{ch: make(chan net.Conn, 16), addr: ln.Addr(), closed: make(chan struct{})}
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				close(httpConns.ch)
+				return
+			}
+			p.dials.Add(1)
+			go func(conn net.Conn) {
+				r := bufio.NewReader(conn)
+				if _, err := r.ReadString('\n'); err != nil { // CONNECT 1024\n
+					conn.Close()
+					return
+				}
+				if _, err := conn.Write([]byte("OK 1024\n")); err != nil {
+					conn.Close()
+					return
+				}
+				// Guard against the listener closing mid-handshake: a bare
+				// send would panic if the accept loop closed the channel.
+				select {
+				case httpConns.ch <- &bufferedConn{Conn: conn, r: r}:
+				case <-httpConns.closed:
+					conn.Close()
+				}
+			}(conn)
+		}
+	}()
+	srv := &http.Server{Handler: handler}
+	go srv.Serve(httpConns) //nolint:errcheck
+	// Use Shutdown with a short timeout so stale keep-alive connections don't
+	// block cleanup. The transport's CloseIdleConnections (called earlier via
+	// the test's own t.Cleanup) drains idle conns; any remaining active conns
+	// are abandoned when the context expires.
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		defer cancel()
+		srv.Shutdown(ctx) //nolint:errcheck
+	})
+	return p
+}
+
+// TestSSEConnectionReuse: consecutive SSE requests must reuse one vsock
+// connection. Before the drain-on-Close fix, every request re-dialed.
+//
+// The handler writes the terminal event, flushes, then sends the final
+// newline after a 10 ms pause. This ensures:
+//   - The event bytes arrive before the client calls rd.Close() (flushed),
+//     so the body is genuinely not at EOF when Close begins.
+//   - The remaining data (empty trailing newline → EOF) arrives within
+//     the 100 ms drain window in the fixed Close, so the drain succeeds and
+//     the connection is returned to the keep-alive pool.
+func TestSSEConnectionReuse(t *testing.T) {
+	sock := filepath.Join(t.TempDir(), "vsock.uds")
+	proxy := startFakeVsockProxy(t, sock, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Error("ResponseWriter does not implement http.Flusher")
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "event: complete\ndata: {\"exit_code\":0,\"elapsed_ms\":1}\n\n")
+		flusher.Flush()
+		// Keep the body open briefly so the client encounters a non-EOF body
+		// when it calls rd.Close(). Return after 10 ms so the drain window
+		// (100 ms) can read EOF and allow connection reuse.
+		time.Sleep(10 * time.Millisecond)
+	}))
+
+	tr := vsockTransport(sock).(*http.Transport)
+	client := newClient("http://localhost", &http.Client{Transport: tr})
+	// Close idle connections after the test so srv.Shutdown() can complete.
+	t.Cleanup(func() { tr.CloseIdleConnections() })
+
+	ctx := context.Background()
+	for i := 0; i < 3; i++ {
+		rd, err := client.postSSE(ctx, "/v1/shell/exec", map[string]any{"command": "true"})
+		if err != nil {
+			t.Fatalf("postSSE %d: %v", i, err)
+		}
+		for rd.Next() {
+			if rd.Event() == "complete" {
+				break
+			}
+		}
+		rd.Close()
+	}
+
+	if got := proxy.dials.Load(); got != 1 {
+		t.Errorf("expected 1 vsock dial across 3 SSE requests, got %d", got)
 	}
 }

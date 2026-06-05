@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -95,5 +96,22 @@ func TestEnsureScratchTemplate(t *testing.T) {
 	}
 	if sentinel[0] != 0xAA {
 		t.Error("template was recreated; expected idempotent no-op")
+	}
+}
+
+func TestScratchTemplateHasNoJournal(t *testing.T) {
+	if _, err := exec.LookPath("dumpe2fs"); err != nil {
+		t.Skip("dumpe2fs not installed")
+	}
+	path := filepath.Join(t.TempDir(), "scratch.ext4")
+	if err := ensureScratchTemplate(path, 64); err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command("dumpe2fs", "-h", path).CombinedOutput()
+	if err != nil {
+		t.Fatalf("dumpe2fs: %v: %s", err, out)
+	}
+	if strings.Contains(string(out), "has_journal") {
+		t.Error("scratch template has a journal — ephemeral disks must be journal-less")
 	}
 }

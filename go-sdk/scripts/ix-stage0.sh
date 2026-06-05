@@ -20,13 +20,22 @@ set -e
 mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
 
 # Per-VM writable scratch disk. The /scratch mountpoint is baked into the
-# image by build-rootfs-ext4.sh.
-mount /dev/vdb /scratch
+# image by build-rootfs-ext4.sh. noatime: every read would otherwise write
+# an atime update to the scratch on the agent's file-op hot path.
+mount -o noatime /dev/vdb /scratch
 
-mkdir -p /scratch/upper /scratch/work /scratch/newroot
+mkdir -p /scratch/upper /scratch/work /scratch/newroot /scratch/workspace
 mount -t overlay overlay \
   -o lowerdir=/,upperdir=/scratch/upper,workdir=/scratch/work \
   /scratch/newroot
+
+# /workspace hot path: bind the scratch's own directory OVER the overlay's
+# /workspace so agent file ops write raw ext4 — no overlayfs lookup/copy-up
+# machinery in the write path. Everything else (pip installs, /etc writes)
+# still goes through the whole-root overlay. mkdir writes the overlay upper,
+# guaranteeing the mountpoint exists regardless of the base image.
+mkdir -p /scratch/newroot/workspace
+mount --bind /scratch/workspace /scratch/newroot/workspace
 
 # Pivot into the overlay. put_old must exist inside the new root; mkdir here
 # writes to the upper layer (the overlay root is writable).

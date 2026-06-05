@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -39,6 +40,20 @@ func gatewayURLFromAddr(addr string) string {
 	return "http://" + addr
 }
 
+// browserTierEnv builds the env slice passed to the browser-tier VM
+// (surfaced to the guest as ix.env.* kernel cmdline params, parsed by
+// browser-vm-init into pinchtab's config).
+func browserTierEnv(cfg ManagerConfig) []string {
+	var env []string
+	if cfg.GatewayToken != "" {
+		env = append(env, "PINCHTAB_TOKEN="+cfg.GatewayToken)
+	}
+	if len(cfg.BrowserTrustedResolveCIDRs) > 0 {
+		env = append(env, "PINCHTAB_TRUSTED_RESOLVE_CIDRS="+strings.Join(cfg.BrowserTrustedResolveCIDRs, ","))
+	}
+	return env
+}
+
 // startBrowserTier boots the browser-tier VM, waits for pinchtab to become
 // healthy over vsock (no READY handshake — pinchtab doesn't send one), then
 // serves the Gateway on cfg.GatewayListenAddr. On success it returns a
@@ -54,12 +69,7 @@ func startBrowserTier(ctx context.Context, fb *firecrackerBackend, cfg ManagerCo
 		extra = append(extra, buildDriveSpec("state", cfg.BrowserStateImage, false))
 	}
 
-	var env []string
-	if cfg.GatewayToken != "" {
-		env = append(env, "PINCHTAB_TOKEN="+cfg.GatewayToken)
-	}
-
-	handle, err := fb.startVMCold(ctx, "browser-tier", 2, cfg.BrowserVMMemoryMB, cfg.BrowserVMImage, env, extra, false)
+	handle, err := fb.startVMCold(ctx, "browser-tier", 2, cfg.BrowserVMMemoryMB, cfg.BrowserVMImage, browserTierEnv(cfg), extra, false)
 	if err != nil {
 		return nil, "", fmt.Errorf("boot browser-tier VM: %w", err)
 	}
