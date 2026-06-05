@@ -9,7 +9,7 @@ Go: 1.26.1
 ## End-to-End Progress Tracker
 
 All numbers measured with Go integration benchmarks (`benchtime=3x` through
-v0.6; from v0.6.1 on: `benchtime=10x`, `count=5`, medians, benchstat for
+v0.1; from v0.1.1 on: `benchtime=10x`, `count=5`, medians, benchstat for
 significance).
 
 ### Optimization history
@@ -17,37 +17,27 @@ significance).
 | Version | VMM | Transport | Creation | ShellPersistent | FileReadWrite | CodeExec (Python) | E2E (with Python) |
 |---|---|---|---|---|---|---|---|
 | v0.0 | Docker | TCP | 854ms | — | 80ms | 128ms | 753ms |
-| v0.1 | Docker | Unix socket | 849ms | — | 46ms | 53ms | 422ms |
-| v0.2 | Docker | Unix socket | **368ms** | — | 45ms | FAIL | 393ms |
-| v0.3 | Firecracker | vsock UDS | 935ms cold | 20ms | 9ms | 15,100ms (Jupyter) | — |
-| v0.3.1 | Firecracker | vsock UDS | 471ms cold | 15ms | 7ms | 15,100ms (Jupyter) | — |
-| v0.4 | Firecracker | vsock UDS | 47ms snapshot | 15ms | 6ms | 15,100ms (Jupyter) | 78ms (no code) |
-| **v0.5** | **Firecracker** | **vsock UDS** | **45ms snapshot** | **12ms** | **8ms** | **17ms (stdin REPL)** | **72ms** |
-| **v0.6** | **Firecracker** | **vsock UDS** | **75ms snapshot** | **30ms** | **19ms** | **26ms** | **131ms** |
-| **v0.6.1** | **Firecracker** | **vsock UDS** | **28ms snapshot** | **13ms** | **8.6ms** | **16ms** | **78ms** |
-| **v0.7** | **Firecracker** | **vsock UDS** | **15ms snapshot** | **6.9ms** | **8.5ms (1.4ms /workspace)** | **6.0ms** | **59ms** |
+| v0.1 | Firecracker | vsock UDS | 75ms snapshot | 30ms | 19ms | 26ms | 131ms |
+| **v0.2** | **Firecracker** | **vsock UDS** | **15ms snapshot** | **6.9ms** | **8.5ms (1.4ms /workspace)** | **6.0ms** | **59ms** |
 | **Target** | **Firecracker** | **vsock UDS** | **<100ms** | **<3ms** | **<6ms** | **<10ms** | **<25ms** |
 
-**v0.5 notes:** Replaced Jupyter/ZMQ kernel (15s boot) with stdin/stdout REPL (<100ms boot). Python code exec dropped from 15,100ms to 17ms — **888x faster**. REPL survives snapshot/restore because stdin/stdout pipes are kernel-managed IPC. E2E agent cycle with Python: 72ms.
-
-**v0.6 notes:** Security/correctness release, not a perf release — every VM previously
+**v0.1 notes:** Security/correctness milestone, not a perf one — every VM previously
 mounted the SAME rootfs image read-write (fleet-wide ext4 corruption + cross-tenant
 persistence bug). Now: shared read-only rootfs + per-VM sparse scratch disk via a
-whole-root overlayfs (`ix-stage0`). The regression vs v0.5 conflates TWO changes that
-landed in between: per-VM TAP + host NAT networking (v0.5 had no working egress) and
-the disk isolation itself — TAP setup was never benchmarked separately. n=5 runs are
-noisy (±30-80% run-to-run on creation paths); the most reproducible signal is
-FileReadWrite 8→19ms (overlayfs on the /workspace write path). Candidate follow-ups:
-bind-mount the scratch disk directly at /workspace (takes overlayfs out of the agent
-file-ops hot path), journal-less scratch ext4, `benchtime 20x` for stable numbers.
+whole-root overlayfs (`ix-stage0`). The numbers conflate TWO changes that landed
+together: per-VM TAP + host NAT networking (there was previously no working egress)
+and the disk isolation itself — TAP setup was never benchmarked separately. n=5 runs
+are noisy (±30-80% run-to-run on creation paths); the most reproducible signal is
+FileReadWrite 8→19ms (overlayfs on the /workspace write path).
 
-**v0.6.1 notes:** Not a code release — same SDK/daemon as v0.6, benchmarks fixed
-and re-run to create an honest baseline for v0.7. The published v0.6 numbers were
-inflated 1.7–2.4x by benchmark bugs (pool benches raced the filler and measured
-pool-miss cold boots; creation benches timed Destroy inside the loop) plus host
-conditions. All v0.7 claims are judged against v0.6.1, not v0.6.
+**v0.1.1 notes:** Not a code release — same SDK/daemon as v0.1, benchmarks fixed
+and re-run to create an honest baseline for v0.2 (28ms snapshot create, 13ms shell,
+16ms code exec, 78ms E2E — full numbers in its section below). The published v0.1
+numbers were inflated 1.7–2.4x by benchmark bugs (pool benches raced the filler and
+measured pool-miss cold boots; creation benches timed Destroy inside the loop) plus
+host conditions. All v0.2 claims are judged against v0.1.1, not v0.1.
 
-**v0.7 notes:** Perf overhaul — daemon-side persistent shell sessions, concurrent
+**v0.2 notes:** Perf overhaul — daemon-side persistent shell sessions, concurrent
 REPL stdout/stderr reads (removed a fixed 10 ms drain per exec), serial console off
 (`8250.nr_uarts=0` + `quiet`), `RUST_LOG=warn` default, vsock HTTP keep-alive, a
 scratch pre-copy pool (snapshot-clone scratch is an `os.Rename`, 11 µs vs ~12 ms
@@ -56,23 +46,13 @@ destroy, and `/workspace` bind-mounted directly on the scratch disk (overlayfs o
 of the agent file-ops hot path). Targets hit: Creation 15 ms (<100), CodeExec
 6.0 ms (<10), File R+W on /workspace 1.4 ms (<6). Still open: ShellPersistent
 6.9 ms (<3 target), E2E 59 ms (<25 — now dominated by Destroy's kill+wait).
-Inaugural browser-tier benchmarks added (see v0.7 section).
+Inaugural browser-tier benchmarks added (see v0.2 section).
 
-### v0.5 vs v0.0 — full journey
-
-| Benchmark | v0.0 (Docker/TCP) | v0.5 (Firecracker/snapshot/REPL) | Speedup |
-|---|---|---|---|
-| **Creation** | 854ms | **45ms** | **19x** |
-| **Shell (persistent)** | — | **12ms** | — |
-| **File R+W** | 80ms | **8ms** | **10x** |
-| **Code exec (Python)** | 128ms | **17ms** | **7.5x** |
-| **E2E agent cycle** | 753ms | **72ms** | **10.5x** |
-
-### v0.7 — perf overhaul: shell sessions, REPL drain fix, quiet boot, scratch pool, two-phase destroy (2026-06-04)
+### v0.2 — perf overhaul: shell sessions, REPL drain fix, quiet boot, scratch pool, two-phase destroy (2026-06-04)
 
 VMM: Firecracker v1.15.1, kernel vmlinux 6.1.155, host kernel 7.0.0-22
 Method: frozen test binaries (pre/post), `benchtime 10x`, `count 5`, medians;
-compared against the v0.6.1 baseline (identical pre-optimization code, same
+compared against the v0.1.1 baseline (identical pre-optimization code, same
 fixed benchmarks, same host, same day) so every delta is code-attributable.
 Raw runs: `go-sdk/bench-results/{clean-v061,clean-v07}.txt`.
 
@@ -98,9 +78,9 @@ BenchmarkE2ESnapshotCycle-16          5     58873477 ns/op   136974 B/op    887 
 BenchmarkDestroy-16                   5     24638811 ns/op     2952 B/op     29 allocs/op
 ```
 
-**Per-fix attribution (benchstat v0.6.1 → v0.7, p=0.008 unless n.s.):**
+**Per-fix attribution (benchstat v0.1.1 → v0.2, p=0.008 unless n.s.):**
 
-| Benchmark | v0.6.1 | v0.7 | Δ | What did it |
+| Benchmark | v0.1.1 | v0.2 | Δ | What did it |
 |---|---|---|---|---|
 | CreateCold | 405.3ms | 181.1ms | **-55%** | serial console off (`8250.nr_uarts=0` + `quiet`) — boot log writes to ttyS0 were the biggest cold-boot cost |
 | CreateFromSnapshot | 27.8ms | 15.3ms | **-45%** | scratch pre-copy pool (clone = `os.Rename`, 11µs vs ~12ms `cp --sparse`) + immediate-first-probe 1ms health tick |
@@ -136,9 +116,9 @@ CreateFromSnapshot 15.3ms total
   the health poll (VM resume → first /health 200) is now the dominant cost
 ```
 
-**Strict-10x scorecard (the v0.7 goal was 10x vs published v0.6):**
+**Strict-10x scorecard (the v0.2 goal was 10x vs published v0.1):**
 
-| Metric | v0.6 published | 10x target | v0.7 | vs v0.6 | vs v0.6.1 (code only) |
+| Metric | v0.1 published | 10x target | v0.2 | vs v0.1 | vs v0.1.1 (code only) |
 |---|---|---|---|---|---|
 | Creation (snapshot) | 75.1ms | 7.5ms | 15.3ms | **4.9x** | 1.8x |
 | ShellPersistent | 30.2ms | 3.0ms | 6.9ms | **4.4x** | 1.9x |
@@ -147,7 +127,7 @@ CreateFromSnapshot 15.3ms total
 | E2E (snapshot cycle) | 130.6ms | 13.1ms | 58.9ms | **2.2x** | 1.3x |
 
 Verdict: strict 10x reached only on /workspace file ops. Honest split: roughly
-half the headline gap closed by fixing measurement (v0.6.1), the other half by
+half the headline gap closed by fixing measurement (v0.1.1), the other half by
 code (1.3–2.7x per op). The remaining distance is floors, not slack:
 
 - **vsock+HTTP round-trip ≈ 0.7ms/request** (FileReadWriteWorkspace = 2
@@ -206,12 +186,12 @@ BenchmarkBrowserE2E-16           5   1901138987 ns/op   332300 B/op   2970 alloc
 No prior numbers exist — this is the baseline future work is measured against.
 Numbers are from the post-fix rerun (`v0.7-browser-postfix2.txt`, all 7
 benchmarks 5/5 PASS) after the eval and capture-timeout fixes below; the
-initial v0.7 run had two failing benchmarks. BrowserEval at 1.05ms is the
+initial v0.2 run had two failing benchmarks. BrowserEval at 1.05ms is the
 measured floor of the entire cross-VM browser path — every other op's cost is
 Chrome work, not plumbing. Note: snapshot-restored VMs are vsock-only (no
 TAP), so browser benches use the cold-boot pool, never `UseSnapshot`.
 
-**Bugs found by the v0.7 browser run (both fixed and verified by rerun):**
+**Bugs found by the v0.2 browser run (both fixed and verified by rerun):**
 
 - `BenchmarkBrowserEval` failed 5/5 in the initial run. Root cause: pinchtab's
   `/evaluate` returns `{"result": <raw JSON value>}` — the bench's `1+1` comes
@@ -231,17 +211,17 @@ TAP), so browser benches use the cold-boot pool, never `UseSnapshot`.
   pinchtab's descriptive error surfaces. `getRaw` now includes the error body.
   Verified: post-fix rerun passes 5/5 with a tight 358–403ms spread.
 
-**Open questions (v0.7):**
+**Open questions (v0.2):**
 
 - File ops on `/tmp` are ~6x slower than `/workspace` (8.5ms vs 1.4ms per
-  write+read pair) in BOTH v0.6.1 and v0.7 — pre-existing, not a regression.
+  write+read pair) in BOTH v0.1.1 and v0.2 — pre-existing, not a regression.
   `/tmp` should be tmpfs (fast); root cause TBD.
 
-### v0.6.1 — baseline re-measurement, fixed benchmarks (2026-06-04)
+### v0.1.1 — baseline re-measurement, fixed benchmarks (2026-06-04)
 
-Same SDK/daemon code as v0.6 — only the benchmarks changed. Re-run to create an
-honest baseline for v0.7, because two benchmark bugs inflated the published
-v0.6 numbers:
+Same SDK/daemon code as v0.1 — only the benchmarks changed. Re-run to create an
+honest baseline for v0.2, because two benchmark bugs inflated the published
+v0.1 numbers:
 
 - `CreateFromPool` / `CreatePoolPreWarmed` raced the pool filler and mostly
   measured pool-miss cold boots (published 293ms / 370ms). Fixed with
@@ -274,12 +254,12 @@ BenchmarkE2ESnapshotCycle-16          5     77774376 ns/op   122262 B/op    867 
 BenchmarkDestroy-16                   5     26282256 ns/op     4553 B/op     39 allocs/op
 ```
 
-Published v0.6 vs v0.6.1 on identical code: ShellPersistent 30.2→12.9ms,
+Published v0.1 vs v0.1.1 on identical code: ShellPersistent 30.2→12.9ms,
 CodeExecSnapshot 26.1→16.0ms, CreateFromSnapshot 75.1→27.8ms, E2ESnapshotCycle
 130.6→77.8ms. That 1.7–2.4x gap is measurement methodology plus host
-conditions, not code — which is why v0.7 is judged against v0.6.1, not v0.6.
+conditions, not code — which is why v0.2 is judged against v0.1.1, not v0.1.
 
-### v0.6 — read-only rootfs + per-VM scratch overlay (2026-06-04)
+### v0.1 — read-only rootfs + per-VM scratch overlay (2026-06-04)
 
 VMM: Firecracker v1.15.1, kernel vmlinux 6.1.155, host kernel 7.0.0-22
 Disk: shared ro rootfs (`is_read_only: true`) + per-VM sparse scratch ext4 (10 GB)
@@ -311,7 +291,7 @@ All three are now structurally impossible and regression-tested
 (`TestRootfsImmutableUnderConcurrentWrites`, `TestWorkspaceIsolation`,
 `TestSnapshotCloneIsolation`).
 
-**Where the new time goes (vs v0.5):**
+**Where the new time goes (vs the pre-isolation build):**
 
 ```
 CreateCold: +~190ms       TAP create + addr + up (3x ip exec) + nft, scratch
@@ -322,120 +302,6 @@ Shell/File/Code: +8-23ms  every guest path lookup now traverses overlayfs;
                           /workspace writes hit the overlay upper (copy-up
                           machinery) instead of raw ext4
 ```
-
-### v0.5 — Firecracker + snapshot + stdin REPL (2026-05-25)
-
-VMM: Firecracker v1.15.1, kernel vmlinux-5.10.245
-Transport: HTTP+SSE over Firecracker vsock UDS proxy
-Code execution: stdin/stdout REPL (replaced Jupyter/ZMQ)
-Creation: snapshot/restore (no kernel boot)
-
-```
-BenchmarkCreateCold-16            5    424088063 ns/op    112262 B/op     672 allocs/op
-BenchmarkCreateFromSnapshot-16    5     45218424 ns/op     64673 B/op     327 allocs/op
-BenchmarkShellPersistent-16       5     12120983 ns/op     20337 B/op     118 allocs/op
-BenchmarkShellOneShot-16          5     15090712 ns/op     17700 B/op     124 allocs/op
-BenchmarkFileReadWrite-16         5      7706302 ns/op     31667 B/op     192 allocs/op
-BenchmarkCodeExecSnapshot-16      5     17000149 ns/op     30016 B/op     117 allocs/op
-BenchmarkE2ESnapshotCycle-16      5     72022564 ns/op    131425 B/op     770 allocs/op
-```
-
-### v0.3 vs v0.2 (Docker baseline)
-
-| Benchmark | Docker v0.2 | Firecracker v0.3 | Change | What it measures |
-|---|---|---|---|---|
-| **CreateCold** | 368ms | 935ms | 2.5x slower | Full kernel boot + init + daemon start |
-| **ShellEcho** | 42ms | 25ms | **1.7x faster** | `echo hello` round-trip on running sandbox |
-| **ShellPersistent** | — | 20ms | — | Persistent bash session `echo hello` |
-| **ShellOneShot** | — | 21ms | — | Fresh fork+exec per command |
-| **FileReadWrite** | 45ms | **9ms** | **5.0x faster** | Write + read round-trip |
-| **CodeExecPython** | FAIL | 15.1s | — | Warm kernel `x=42` (kernel warmup slow) |
-
-**What improved:** Operations on a running sandbox are 1.7-5x faster. Firecracker eliminates Docker's container namespace transitions (~22-43ms overhead per operation). File I/O sees the biggest gain because virtiofs block device access has no namespace overhead.
-
-**What regressed:** Cold start is 2.5x slower (935ms vs 368ms). Firecracker boots a full Linux kernel + runs init + starts daemon, vs Docker which shares the host kernel. The VM pool eliminates this from the hot path.
-
-**What's broken:** CodeExecPython takes 15s — the Python kernel warmup inside Firecracker is very slow. Needs investigation (likely Jupyter/ZMQ startup overhead in the VM).
-
-### Remaining work (Phase 1)
-
-| Item | Status | Expected impact |
-|---|---|---|
-| VM pool benchmarks | Not measured | CreateCold → <1ms (pool grab) |
-| Pre-warmed Python kernel | Not measured | CodeExecPython → ~10ms |
-| E2E agent cycle (pool) | Not measured | ~25ms target |
-| passt network overhead | Not measured | Baseline for Phase 2 vsock proxy |
-| Cold start optimization | Not started | Boot args tuning, initrd, kernel config |
-
----
-
-## Detailed Results
-
-### v0.3 — Firecracker + passt (2026-05-25)
-
-VMM: Firecracker v1.15.1, kernel vmlinux-5.10.245
-Transport: HTTP+SSE over Firecracker vsock UDS proxy
-Networking: passt (user-mode, no root)
-Rootfs: ext4 image (2 GB, exported from ix:base Docker image)
-
-```
-BenchmarkCreateCold-16           3    935166295 ns/op    115762 B/op     678 allocs/op
-BenchmarkShellEcho-16            3     24728948 ns/op     20661 B/op     136 allocs/op
-BenchmarkShellPersistent-16      3     20210943 ns/op     25850 B/op     121 allocs/op
-BenchmarkShellOneShot-16         3     21334284 ns/op     17653 B/op     131 allocs/op
-BenchmarkFileReadWrite-16        3      9317124 ns/op     23464 B/op     198 allocs/op
-BenchmarkCodeExecPython-16       3  15109767692 ns/op     59490 B/op     276 allocs/op
-```
-
-**Where time goes (v0.3 Firecracker):**
-
-```
-CreateCold: 935ms total
-  ├── Firecracker process start       ~5ms
-  ├── API socket ready                ~5ms
-  ├── VM config (5x PUT)              ~5ms
-  ├── Linux kernel boot               ~850ms
-  ├── ix-init (mount, env parse)      ~10ms
-  ├── ixd daemon start                ~50ms
-  └── READY signal over vsock         ~10ms
-
-ShellEcho: 25ms total (was 42ms)
-  ├── vsock CONNECT handshake         ~1ms
-  ├── HTTP + SSE overhead             ~2ms
-  ├── fork+exec (bash -l -c "echo")   ~18ms (unchanged)
-  └── Remaining overhead              ~4ms (was ~22ms with Docker)
-
-FileReadWrite: 9ms total (was 45ms)
-  ├── 2x vsock CONNECT + HTTP         ~4ms
-  ├── File write (tokio::fs)          ~0.1ms
-  ├── File read + format              ~0.01ms
-  └── Remaining overhead              ~5ms (was ~43ms with Docker)
-```
-
-### v0.2 — Docker P0 optimizations (2026-05-24)
-
-Docker 29.5.2, ix:base image (914 MB), Unix domain socket transport.
-Two-phase waitReady (10ms socket poll + 25ms health poll), parallel pool fill.
-
-| Benchmark | v0.1 | v0.2 (P0) | Change | Allocs/op |
-|---|---|---|---|---|
-| CreateCold | 849ms | **368ms** | **2.3x faster** | 838 |
-| CreateFromPool | 529ms | **465ms** | 1.1x faster | 1,023 |
-| ShellEcho | 50ms | **42ms** | 1.2x faster | 183 |
-| CodeExecPython | 53ms | **FAIL** | — | — |
-| CodeExecFirstCall | 2,442ms | **2,750ms** | ~1.0x | 1,033 |
-| FileReadWrite | 46ms | **45ms** | ~1.0x | 250 |
-| EndToEnd | 422ms | **393ms** | **1.1x faster** | 1,335 |
-
-### v0.1 — Unix socket transport (2026-05-24)
-
-| Benchmark | TCP (v0.0) | Unix socket (v0.1) | Speedup |
-|---|---|---|---|
-| CreateCold | 854ms | 849ms | 1.0x |
-| ShellEcho | 126ms | **50ms** | **2.5x** |
-| CodeExecPython | 128ms | **53ms** | **2.4x** |
-| FileReadWrite | 80ms | **46ms** | **1.7x** |
-| EndToEnd | 753ms | **422ms** | **1.8x** |
 
 ---
 
@@ -510,14 +376,15 @@ All sub-microsecond — never the bottleneck.
 
 ## Comparison with Competitors
 
-| Metric | ix v0.2 (Docker) | ix v0.3 (Firecracker) | OpenSandbox | CubeSandbox |
-|---|---|---|---|---|
-| Creation (cold) | 368ms | 935ms | ~0.92s (K8s) | **<60ms** (snapshot) |
-| Creation (pool) | ~1ms | not measured | — | — |
-| Shell echo e2e | 42ms | **25ms** | — | — |
-| File R+W | 45ms | **9ms** | — | — |
-| Code exec (warm) | 53ms (v0.1) | — | 50-200ms | — |
-| Per-sandbox memory | ~2 GB | ~512 MB | ~50 MB | **<5 MB** |
+| Metric | ix v0.2 (Firecracker) | OpenSandbox | CubeSandbox |
+|---|---|---|---|
+| Creation (cold) | 181ms | ~0.92s (K8s) | — |
+| Creation (snapshot) | **15ms** | — | **<60ms** |
+| Creation (pool) | 11ms | — | — |
+| Shell echo e2e | **8.6ms** | — | — |
+| File R+W | 8.5ms (**1.4ms** /workspace) | — | — |
+| Code exec (warm) | **6.0ms** | 50-200ms | — |
+| Per-sandbox memory | ~512 MB | ~50 MB | **<5 MB** |
 
 ---
 
