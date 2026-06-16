@@ -2,6 +2,9 @@ package ix
 
 import (
 	"context"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -236,6 +239,27 @@ func TestApplyDefaultsNetworkCIDR(t *testing.T) {
 	}
 }
 
+func TestPreconfiguredNetworkDefaults(t *testing.T) {
+	t.Setenv("IX_PRECONFIGURED_NETWORK", "1")
+	c := ManagerConfig{}
+	c.applyDefaults()
+	if !c.PreconfiguredNetwork {
+		t.Error("IX_PRECONFIGURED_NETWORK=1 should set PreconfiguredNetwork")
+	}
+	if c.NetworkManifest != "/etc/ix/network.json" {
+		t.Errorf("NetworkManifest default = %q, want /etc/ix/network.json", c.NetworkManifest)
+	}
+}
+
+func TestPreconfiguredNetworkExplicitOff(t *testing.T) {
+	t.Setenv("IX_PRECONFIGURED_NETWORK", "")
+	c := ManagerConfig{}
+	c.applyDefaults()
+	if c.PreconfiguredNetwork {
+		t.Error("PreconfiguredNetwork should default false without the env var")
+	}
+}
+
 func TestApplyDefaultsScratchAndRunDir(t *testing.T) {
 	cfg := ManagerConfig{RootfsImage: "/opt/ix/rootfs/base.ext4"}
 	cfg.applyDefaults()
@@ -258,5 +282,53 @@ func TestApplyDefaultsScratchAndRunDir(t *testing.T) {
 	cfg2.applyDefaults()
 	if cfg2.RunDir != "/var/lib/ix/run" || cfg2.ScratchSizeMB != 2048 {
 		t.Errorf("explicit values overridden: RunDir=%q ScratchSizeMB=%d", cfg2.RunDir, cfg2.ScratchSizeMB)
+	}
+}
+
+// TestPreconfiguredNetworkMissingManifest asserts NewManager fails cleanly (no
+// panic) in preconfigured mode when the manifest path does not exist. The error
+// must come from the preconfigured-network branch, not a nil-deref.
+func TestPreconfiguredNetworkMissingManifest(t *testing.T) {
+	dir := t.TempDir()
+
+	rootfs := filepath.Join(dir, "rootfs.ext4")
+	if err := os.WriteFile(rootfs, []byte{}, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	kernel := filepath.Join(dir, "vmlinux")
+	if err := os.WriteFile(kernel, []byte{}, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runDir := filepath.Join(dir, "run")
+	if err := os.MkdirAll(runDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Pre-create the scratch template so ensureScratchTemplate short-circuits on
+	// os.Stat and never shells out to mkfs.ext4 (keeps the test hermetic).
+	if err := os.WriteFile(filepath.Join(runDir, "scratch-template.ext4"), []byte{}, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := ManagerConfig{
+		RootfsImage:          rootfs,
+		KernelPath:           kernel,
+		FCBinary:             "/bin/true",
+		RunDir:               runDir,
+		PreconfiguredNetwork: true,
+		NetworkManifest:      filepath.Join(dir, "does-not-exist.json"),
+	}
+
+	m, err := NewManager(context.Background(), cfg)
+	if m != nil {
+		t.Fatalf("NewManager returned a non-nil manager on error: %+v", m)
+	}
+	if err == nil {
+		t.Fatal("NewManager succeeded with a missing manifest; want an error")
+	}
+	// Both the ip_forward-off and manifest-load error paths are part of the
+	// preconfigured-network branch and share this prefix, so the assertion is
+	// deterministic regardless of the host's ip_forward state.
+	if !strings.Contains(err.Error(), "preconfigured network") {
+		t.Fatalf("error %q does not mention the preconfigured network branch", err)
 	}
 }

@@ -132,7 +132,7 @@ type firecrackerBackend struct {
 	rootfsImage     string
 	logger          *slog.Logger
 	snapshot        *SnapshotManager // optional; when set, startVM uses snapshot restore
-	tapAlloc        *tapAllocator    // TAP index allocator (set by the manager; nil only in tests that never cold-boot)
+	net             netProvider      // per-VM TAP provider (set by the manager; nil only in tests that never cold-boot)
 	disableNet      bool             // skip TAP setup entirely (vsock-only VM)
 	runDir          string           // base dir for per-VM dirs (sockets + scratch); empty = os.TempDir()
 	scratchTemplate string           // empty sparse ext4 copied per VM as the scratch drive; empty = no scratch (bare test backends)
@@ -205,22 +205,16 @@ func (fb *firecrackerBackend) startVMCold(ctx context.Context, sandboxID string,
 	var vn *vmNet
 	if !fb.disableNet && !forceNoNet {
 		tTap := time.Now()
-		if fb.tapAlloc == nil {
+		if fb.net == nil {
 			_ = os.RemoveAll(socketDir)
-			return nil, fmt.Errorf("networking enabled but tap allocator not configured")
+			return nil, fmt.Errorf("networking enabled but net provider not configured")
 		}
-		idx, err := fb.tapAlloc.alloc()
+		acquired, err := fb.net.acquire(ctx)
 		if err != nil {
 			_ = os.RemoveAll(socketDir)
-			return nil, fmt.Errorf("allocate tap index: %w", err)
+			return nil, fmt.Errorf("acquire tap: %w", err)
 		}
-		net, err := setupTap(ctx, idx)
-		if err != nil {
-			fb.tapAlloc.release(idx)
-			_ = os.RemoveAll(socketDir)
-			return nil, fmt.Errorf("setup tap: %w", err)
-		}
-		vn = &net
+		vn = acquired
 		tracePhase(fb.logger, "coldboot", "tap", tTap)
 	}
 
@@ -230,13 +224,8 @@ func (fb *firecrackerBackend) startVMCold(ctx context.Context, sandboxID string,
 		if proc != nil {
 			_ = proc.Kill()
 		}
-		if vn != nil {
-			if err := teardownTap(context.Background(), *vn); err != nil && fb.logger != nil {
-				fb.logger.Warn("teardown tap (error path)", "tap", vn.tapName, "error", err)
-			}
-			if fb.tapAlloc != nil {
-				fb.tapAlloc.release(vn.idx)
-			}
+		if vn != nil && fb.net != nil {
+			fb.net.release(vn, fb.logger)
 		}
 		_ = os.RemoveAll(socketDir)
 	}
@@ -376,11 +365,8 @@ func (fb *firecrackerBackend) cleanup(handle *VMMHandle) {
 		_, _ = handle.Process.Wait()
 	}
 	if handle.Net != nil {
-		if err := teardownTap(context.Background(), *handle.Net); err != nil && fb.logger != nil {
-			fb.logger.Warn("teardown tap", "tap", handle.Net.tapName, "error", err)
-		}
-		if fb.tapAlloc != nil {
-			fb.tapAlloc.release(handle.Net.idx)
+		if fb.net != nil {
+			fb.net.release(handle.Net, fb.logger)
 		}
 	}
 	if handle.SocketDir != "" {

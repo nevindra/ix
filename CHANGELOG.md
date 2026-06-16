@@ -6,6 +6,48 @@ Tags follow the Go module convention for the SDK (`go-sdk/vX.Y.Z`).
 
 ## [Unreleased]
 
+### Added
+
+- **Preconfigured (rootless) network mode** — a documented mode where all
+  privileged host networking is done once at setup time so the manager runs
+  fully unprivileged afterward. New `go-sdk/scripts/ix-host-setup.sh` (root,
+  idempotent) enables/persists `ip_forward`, installs the `ix-nat` nftables
+  table, creates a pool of owner-attributed persistent TAPs (`ip tuntap add …
+  user <svc>`), and writes a manifest (`/etc/ix/network.json`). With
+  `ManagerConfig.PreconfiguredNetwork` (or `IX_PRECONFIGURED_NETWORK=1`) the
+  manager skips `ensureHostNAT`/`ensureForwardAccept`/`ensureGatewayAddr`,
+  verifies `ip_forward` by reading `/proc`, and allocates per-VM TAPs from the
+  manifest pool instead of shelling out to `ip`. Per-VM TAP lifecycle is now
+  behind a `netProvider` interface (`dynamicNet` for root mode, unchanged;
+  `preconfiguredNet` for the pooled path). The manifest pool size is the hard
+  concurrency cap; pool exhaustion returns a typed `ErrNetworkPoolExhausted`;
+  missing TAPs are dropped (others keep working), all-missing fails fast with a
+  "re-run ix-host-setup" error. Operator guide in
+  `docs/handbook/preprovisioned-network.md`.
+- **Prebuilt rootfs bundle publishing** — CI now builds each Dockerfile stage
+  with an explicit `target:` (so `latest`/`base` carries `ixd`) across a
+  per-stage matrix (`base`, `browser`, `browser-vm`) with tier suffixes and
+  per-stage GHA cache scopes. A new `build-bundle` job, on `v*` tags, assembles
+  `firecracker + jailer + vmlinux.bin + base.ext4` (ixd baked) into
+  `ix-bundle-<ixver>-sdk<x.y>.tar.zst` and publishes it as a GitHub release
+  asset, so consumers download a ready `/opt/ix` tree instead of building a
+  rootfs on the host. New `scripts/sandbox/` tooling: `install-firecracker.sh`,
+  `build-rootfs-ext4.sh`, `ix-init.sh`, `ix-stage0.sh`, `pack-bundle.sh`.
+  Consumer doc in `docs/handbook/bundle.md`.
+
+### Fixed
+
+- **`ix-init` did not export `PATH`** — kernel-spawned init has an empty
+  environment, so in-VM `python3` resolved via `/bin` (usrmerge), computed
+  `sys.prefix=/`, and silently dropped `/usr/local/lib/pythonX/dist-packages`
+  (every pip-installed package invisible). `ix-init` now exports `PATH` at the
+  top.
+- **Published images shipped without `ixd`** — the base Dockerfile stage now
+  bakes `ixd` into `/usr/local/bin/ixd`, and `build-rootfs-ext4.sh` fails loudly
+  (instead of warning) when `ixd` is neither built nor present in the image — a
+  rootfs without `ixd` boots into a dead VM the host only sees as a health
+  timeout.
+
 ## [0.2.0] - 2026-06-05
 
 ### Added

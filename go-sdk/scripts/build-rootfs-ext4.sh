@@ -74,9 +74,13 @@ copy_daemon_binary() {
     echo "Copying ixd daemon binary..."
     sudo install -m 755 "$DAEMON_BIN" "${temp_dir}/usr/local/bin/ixd"
     echo "✓ Daemon binary installed"
+  elif [[ -x "${temp_dir}/usr/local/bin/ixd" ]]; then
+    echo "✓ Daemon binary already present in image"
   else
-    echo "Warning: Daemon binary not found at $DAEMON_BIN" >&2
-    echo "         Build the daemon first with: cd ../daemon && cargo build --release --target x86_64-unknown-linux-musl" >&2
+    echo "Error: ixd not found at $DAEMON_BIN and not baked into the image." >&2
+    echo "       A rootfs without ixd boots into a dead VM (host sees a health timeout)." >&2
+    echo "       Build it first: cd ../daemon && cargo build --release --target x86_64-unknown-linux-musl -p ix-server" >&2
+    return 1
   fi
 }
 
