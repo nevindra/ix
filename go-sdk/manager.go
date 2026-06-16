@@ -63,10 +63,31 @@ type ManagerConfig struct {
 	NetworkCIDR       string // base address space; default "172.16.0.0/16"
 	DisableNetworking bool   // skip TAP setup (vsock-only VMs)
 
+	// Preconfigured (rootless) network mode. When true, the manager performs no
+	// privileged host-network setup: it loads NetworkManifest (written by
+	// ix-host-setup) and allocates per-VM TAPs from that pool. ip_forward/nft/TAP
+	// creation must already be done by `sudo ix-host-setup`. Also enabled by env
+	// IX_PRECONFIGURED_NETWORK=1.
+	PreconfiguredNetwork bool
+	// NetworkManifest is the path read in preconfigured mode; default
+	// /etc/ix/network.json.
+	NetworkManifest string
+
 	// Per-VM disk isolation. The rootfs is attached read-only and shared;
 	// each VM writes to a private sparse scratch disk (overlay upper layer).
 	RunDir        string // base dir for per-VM runtime dirs (sockets + scratch disks); default: <dir of RootfsImage>/run. Must NOT be on tmpfs.
 	ScratchSizeMB int64  // per-VM scratch disk size in MB (sparse; allocates only what is written); default 10240
+}
+
+// ipForwardEnabled reads /proc/sys/net/ipv4/ip_forward (no privilege needed).
+// In preconfigured mode the manager cannot enable it, so it fails fast with an
+// actionable error when ix-host-setup has not run.
+func ipForwardEnabled() bool {
+	b, err := os.ReadFile("/proc/sys/net/ipv4/ip_forward")
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(b)) == "1"
 }
 
 // applyDefaults fills zero-valued fields with sensible defaults.
@@ -102,6 +123,12 @@ func (c *ManagerConfig) applyDefaults() {
 	}
 	if c.NetworkCIDR == "" {
 		c.NetworkCIDR = "172.16.0.0/16"
+	}
+	if !c.PreconfiguredNetwork && os.Getenv("IX_PRECONFIGURED_NETWORK") == "1" {
+		c.PreconfiguredNetwork = true
+	}
+	if c.NetworkManifest == "" {
+		c.NetworkManifest = "/etc/ix/network.json"
 	}
 	if c.BrowserMode == "remote" {
 		if c.BrowserVMMemoryMB == 0 {
@@ -214,6 +241,71 @@ func NewManager(ctx context.Context, cfg ManagerConfig) (*IXManager, error) {
 
 	mCtx, cancel := context.WithCancel(ctx)
 
+	// Select the per-VM network provider. Preconfigured mode loads the manifest
+	// written by ix-host-setup and never touches privileged host network state.
+	var provider netProvider
+	var preManifest *networkManifest
+	if cfg.DisableNetworking {
+		provider = nil
+	} else if cfg.PreconfiguredNetwork {
+		if !ipForwardEnabled() {
+			cancel()
+			return nil, fmt.Errorf("preconfigured network: ip_forward is off; run `sudo ix-host-setup`")
+		}
+		manifest, err := loadNetworkManifest(cfg.NetworkManifest)
+		if err != nil {
+			cancel()
+			return nil, fmt.Errorf("preconfigured network: %w", err)
+		}
+		if manifest.CIDR != cfg.NetworkCIDR {
+			cancel()
+			return nil, fmt.Errorf("preconfigured network: manifest CIDR %q != config %q", manifest.CIDR, cfg.NetworkCIDR)
+		}
+		preManifest = manifest
+		allNets := manifest.toVMNets()
+		presentNets := filterPresentTaps(allNets, tapExists)
+		if len(presentNets) == 0 {
+			cancel()
+			return nil, fmt.Errorf("preconfigured network: none of the %d manifest TAPs exist on the host; re-run `sudo ix-host-setup`", len(allNets))
+		}
+		if len(presentNets) < len(allNets) {
+			cfg.Logger.Warn("preconfigured network: some manifest TAPs are missing; using the present ones",
+				"present", len(presentNets), "manifest", len(allNets))
+		}
+		pool := newPreconfiguredNet(presentNets)
+		// Available TAPs cap concurrency. The shared browser tier permanently
+		// holds one TAP for the manager's lifetime, so reserve it for the tier.
+		avail := pool.size()
+		if cfg.BrowserMode == "remote" {
+			avail--
+		}
+		if avail < 1 {
+			cancel()
+			return nil, fmt.Errorf("preconfigured network: %d TAP(s) too few (the browser tier needs one); provision more via `ix-host-setup --taps`", pool.size())
+		}
+		// Snapshot-restored VMs are vsock-only and consume no TAP, so the pool
+		// does not bound concurrency in snapshot mode (only cold boots draw from
+		// it). Without snapshot every VM needs a TAP: clamp the admission cap AND
+		// the pool targets down to the available TAP count, else the replenisher
+		// loops forever creating VMs that fail with ErrNetworkPoolExhausted.
+		if !cfg.UseSnapshot {
+			if avail < maxConc {
+				maxConc = avail
+			}
+			if cfg.PoolSize > avail {
+				cfg.PoolSize = avail
+			}
+			if cfg.PoolMinReady > avail {
+				cfg.PoolMinReady = avail
+			}
+		}
+		provider = pool
+		cfg.Logger.Info("preconfigured network mode",
+			"manifest", cfg.NetworkManifest, "taps", pool.size(), "sandboxTaps", avail, "maxConcurrent", maxConc)
+	} else {
+		provider = newDynamicNet()
+	}
+
 	m := &IXManager{
 		cfg: cfg,
 		vmm: &firecrackerBackend{
@@ -221,7 +313,7 @@ func NewManager(ctx context.Context, cfg ManagerConfig) (*IXManager, error) {
 			kernelPath:      cfg.KernelPath,
 			rootfsImage:     cfg.RootfsImage,
 			logger:          cfg.Logger,
-			tapAlloc:        newTapAllocator(0),
+			net:             provider,
 			disableNet:      cfg.DisableNetworking,
 			runDir:          cfg.RunDir,
 			scratchTemplate: scratchTemplate,
@@ -243,7 +335,7 @@ func NewManager(ctx context.Context, cfg ManagerConfig) (*IXManager, error) {
 		m.logger.Warn("recover failed", "error", err)
 	}
 
-	if !cfg.DisableNetworking {
+	if !cfg.DisableNetworking && !cfg.PreconfiguredNetwork {
 		// Empty EgressInterface masquerades on any non-TAP interface (see
 		// nftRuleset) — no uplink detection: pinning NAT to the default-route
 		// interface breaks on multi-homed hosts (split-tunnel VPNs reroute
@@ -268,6 +360,15 @@ func NewManager(ctx context.Context, cfg ManagerConfig) (*IXManager, error) {
 				cancel()
 				return nil, fmt.Errorf("ensure gateway addr: %w", err)
 			}
+		}
+	}
+
+	if cfg.PreconfiguredNetwork && cfg.BrowserMode == "remote" {
+		// ix-host-setup must have pinned the gateway IP on ixgw0; verify the
+		// already-loaded manifest carries it so a misconfigured host fails loudly.
+		if preManifest == nil || preManifest.GatewayIP == "" {
+			cancel()
+			return nil, fmt.Errorf("preconfigured network + remote browser requires gateway_ip in manifest; re-run ix-host-setup --gateway-ip")
 		}
 	}
 
@@ -518,7 +619,9 @@ func (m *IXManager) Close() error {
 	// forward-accept rules and the gateway dummy interface (browser-remote only)
 	// are removed here. Running multiple managers on one host is not supported
 	// (tap names and ixgw0 are global).
-	if !m.cfg.DisableNetworking {
+	// Preconfigured mode: ix-host-setup owns the nft/forward rules and ixgw0, so
+	// the manager must not tear them down (and rootless it lacks the privilege).
+	if !m.cfg.DisableNetworking && !m.cfg.PreconfiguredNetwork {
 		teardownForwardAccept(context.Background())
 		if m.cfg.BrowserMode == "remote" {
 			if err := teardownGatewayAddr(context.Background()); err != nil {

@@ -2,6 +2,11 @@
 # ix-init: PID 1 init script for Firecracker MicroVM
 # Mounts filesystems, sets up networking, parses kernel cmdline, starts daemon
 
+# Kernel-spawned init inherits an empty environment; without PATH, python3
+# resolves via /bin (usrmerge), computes sys.prefix=/, and silently drops
+# /usr/local/lib/pythonX/dist-packages — every pip-installed package vanishes.
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
 echo "ix-init: Starting..."
 
 # Mount essential filesystems (skip if already mounted by kernel)

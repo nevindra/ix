@@ -16,6 +16,8 @@ permissions:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  FC_VERSION: "1.15.1"                                    # firecracker + jailer pin
+  SDK_COMPAT: "0.2"                                       # go-sdk minor ixd targets
 
 jobs:
   test-daemon:
@@ -65,9 +67,18 @@ jobs:
         run: go test ./... -count=1
 
   build-image:
-    name: Docker Image
+    name: Docker Image (${{ matrix.stage }})
     needs: [test-daemon]
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - stage: base
+            suffix: ""          # base is the default image (and :latest)
+          - stage: browser
+            suffix: "-browser"
+          - stage: browser-vm
+            suffix: "-browser-vm"
     steps:
       - uses: actions/checkout@v5
 
@@ -93,19 +104,72 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          flavor: |
+            latest=false
+            suffix=${{ matrix.suffix }},onlatest=true
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=sha,prefix=
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=latest,enable=${{ matrix.stage == 'base' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
 
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: daemon
           file: daemon/cmd/Dockerfile
+          target: ${{ matrix.stage }}
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=ix
-          cache-to: type=gha,mode=max,scope=ix
+          cache-from: type=gha,scope=ix-${{ matrix.stage }}
+          cache-to: type=gha,mode=max,scope=ix-${{ matrix.stage }}
+
+  build-bundle:
+    name: Rootfs bundle
+    needs: [build-image]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write          # create release + upload asset
+      packages: read
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Tools (e2fsprogs, zstd)
+        run: sudo apt-get update && sudo apt-get install -y e2fsprogs zstd
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull base image (this tag)
+        run: |
+          docker pull "${REGISTRY}/${IMAGE_NAME}:${GITHUB_REF_NAME}"
+          docker tag  "${REGISTRY}/${IMAGE_NAME}:${GITHUB_REF_NAME}" ix:base
+
+      - name: Firecracker + kernel
+        run: |
+          sudo IX_FC_DIR=/opt/ix/firecracker \
+            bash go-sdk/scripts/install-firecracker.sh "${FC_VERSION}"
+
+      - name: Assemble rootfs
+        run: |
+          sudo IX_ROOTFS_IMAGE=/opt/ix/rootfs/base.ext4 IX_ROOTFS_SIZE=4096 \
+            bash go-sdk/scripts/build-rootfs-ext4.sh base
+
+      - name: Pack bundle
+        run: |
+          sudo bash go-sdk/scripts/pack-bundle.sh \
+            "${GITHUB_REF_NAME}" "${SDK_COMPAT}" /opt/ix dist
+          ls -la dist
+
+      - name: Publish release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.zst
+            dist/*.sha256
