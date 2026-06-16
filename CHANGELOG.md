@@ -6,7 +6,7 @@ Tags follow the Go module convention for the SDK (`go-sdk/vX.Y.Z`).
 
 ## [Unreleased]
 
-## [go-sdk/v0.3.0] - 2026-06-16
+## [0.3.0] - 2026-06-16
 
 ### Added
 
@@ -122,6 +122,7 @@ First tagged release.
 - SDK aligned with the Oasis sandbox contract; Go module renamed to
   `github.com/nevindra/ix/go-sdk`.
 
-[Unreleased]: https://github.com/nevindra/ix/compare/go-sdk/v0.2.0...HEAD
+[Unreleased]: https://github.com/nevindra/ix/compare/go-sdk/v0.3.0...HEAD
+[0.3.0]: https://github.com/nevindra/ix/compare/go-sdk/v0.2.0...go-sdk/v0.3.0
 [0.2.0]: https://github.com/nevindra/ix/compare/go-sdk/v0.1.1...go-sdk/v0.2.0
 [0.1.1]: https://github.com/nevindra/ix/releases/tag/go-sdk/v0.1.1
