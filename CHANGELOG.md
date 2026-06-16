@@ -6,6 +6,8 @@ Tags follow the Go module convention for the SDK (`go-sdk/vX.Y.Z`).
 
 ## [Unreleased]
 
+## [go-sdk/v0.3.0] - 2026-06-16
+
 ### Added
 
 - **Preconfigured (rootless) network mode** — a documented mode where all
