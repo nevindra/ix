@@ -194,6 +194,12 @@ type IXManager struct {
 	// Benchmarks use it to fail loudly instead of silently timing a cold boot.
 	poolHits atomic.Int64
 
+	// restartsTotal / failuresTotal are cumulative observability counters,
+	// surfaced via Health(). They outlive sandbox destruction (the monitor
+	// destroys a sandbox after markFailed), so a current-map count would lose them.
+	restartsTotal atomic.Int64
+	failuresTotal atomic.Int64
+
 	tier *browserTier // shared browser-tier VM + gateway (nil when BrowserMode != "remote")
 }
 

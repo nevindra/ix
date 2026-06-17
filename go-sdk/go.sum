@@ -1,8 +1,2 @@
 github.com/google/uuid v1.6.0 h1:NIvaJDMOsjHA8n1jAhLSgzrAzy1Hgr+hNrb57e+94F0=
 github.com/google/uuid v1.6.0/go.mod h1:TIyPZe4MgqvfeYDBFedMoGGpEw/LqOeaOT+nhxU+yHo=
-github.com/nevindra/oasis v0.17.0 h1:4ztqazDy+TyKjfl3+8O1dJ2QkM5hX/YqMzm/TxUqCcE=
-github.com/nevindra/oasis v0.17.0/go.mod h1:CKXkB+AVC/8Rmdlvp10D/3tPSFfEJBMPXiC9zq4Gv3Y=
-github.com/nevindra/oasis v0.19.0 h1:AZ1Xuf6FAz9n2lQvQRl9E2RLpKAQD4ToZ/eipXqxxLQ=
-github.com/nevindra/oasis v0.19.0/go.mod h1:CKXkB+AVC/8Rmdlvp10D/3tPSFfEJBMPXiC9zq4Gv3Y=
-github.com/nevindra/oasis v0.20.0 h1:C/zR+AZO3dzAklNUQ8fSrEPEJCX7xn9SHe38Rgp0Sn0=
-github.com/nevindra/oasis v0.20.0/go.mod h1:CKXkB+AVC/8Rmdlvp10D/3tPSFfEJBMPXiC9zq4Gv3Y=

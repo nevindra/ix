@@ -542,9 +542,9 @@ func (s *IXSandbox) WorkspaceInfo(ctx context.Context) (sandbox.WorkspaceInfoRes
 }
 
 // BrowserSnapshot returns the accessibility tree of the current page.
-func (s *IXSandbox) BrowserSnapshot(ctx context.Context, opts sandbox.SnapshotOpts) (sandbox.BrowserSnapshot, error) {
+func (s *IXSandbox) BrowserSnapshot(ctx context.Context, opts sandbox.SnapshotOpts) (sandbox.PageSnapshot, error) {
 	if err := s.checkClosed(); err != nil {
-		return sandbox.BrowserSnapshot{}, err
+		return sandbox.PageSnapshot{}, err
 	}
 
 	q := make(url.Values)
@@ -573,7 +573,7 @@ func (s *IXSandbox) BrowserSnapshot(ctx context.Context, opts sandbox.SnapshotOp
 		} `json:"nodes"`
 	}
 	if err := s.client.getJSON(ctx, path, &resp); err != nil {
-		return sandbox.BrowserSnapshot{}, fmt.Errorf("browser snapshot: %w", err)
+		return sandbox.PageSnapshot{}, fmt.Errorf("browser snapshot: %w", err)
 	}
 
 	nodes := make([]sandbox.SnapshotNode, len(resp.Nodes))
@@ -584,7 +584,7 @@ func (s *IXSandbox) BrowserSnapshot(ctx context.Context, opts sandbox.SnapshotOp
 			Name: n.Name,
 		}
 	}
-	return sandbox.BrowserSnapshot{
+	return sandbox.PageSnapshot{
 		URL:   resp.URL,
 		Title: resp.Title,
 		Nodes: nodes,

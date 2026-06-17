@@ -5,9 +5,12 @@ import (
 	"fmt"
 	"maps"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/nevindra/oasis/sandbox"
 )
 
 // monitor periodically health-checks every sandbox and restarts or marks
@@ -130,10 +133,13 @@ func (m *IXManager) restart(ctx context.Context, sessionID string) {
 		"pid", handle.Process.Pid,
 		"restartCount", newSb.restartCount,
 	)
+
+	m.restartsTotal.Add(1)
 }
 
 // markFailed logs a circuit-breaker event and destroys the sandbox.
 func (m *IXManager) markFailed(ctx context.Context, sessionID string) {
+	m.failuresTotal.Add(1)
 	m.logger.Error("circuit breaker: sandbox exceeded max restarts, destroying",
 		"session", sessionID,
 		"maxRestarts", m.cfg.MaxRestarts,
@@ -144,4 +150,92 @@ func (m *IXManager) markFailed(ctx context.Context, sessionID string) {
 			"error", fmt.Errorf("destroy: %w", err),
 		)
 	}
+}
+
+// Health returns a passive snapshot of runtime readiness and pool state. It
+// reads only already-tracked state — no VM is launched or mutated.
+func (m *IXManager) Health(ctx context.Context) (sandbox.Health, error) {
+	if err := ctx.Err(); err != nil {
+		return sandbox.Health{}, err
+	}
+
+	rt := sandbox.RuntimeInfo{
+		Backend:       "firecracker",
+		KernelPath:    m.cfg.KernelPath,
+		KernelOK:      fileReadable(m.cfg.KernelPath),
+		RootfsImage:   m.cfg.RootfsImage,
+		RootfsOK:      fileReadable(m.cfg.RootfsImage),
+		FCBinary:      m.cfg.FCBinary,
+		FCBinaryOK:    fileExecutable(m.cfg.FCBinary),
+		KVMAccessible: kvmAccessible(),
+	}
+
+	m.mu.RLock()
+	active := len(m.sandboxes)
+	m.mu.RUnlock()
+
+	m.poolMu.Lock()
+	ready := len(m.pool)
+	m.poolMu.Unlock()
+
+	pool := sandbox.PoolStats{
+		Configured: m.cfg.PoolSize,
+		Ready:      ready,
+		Active:     active,
+		Failed:     int(m.failuresTotal.Load()),
+		Restarts:   int(m.restartsTotal.Load()),
+	}
+
+	egress := sandbox.EgressInfo{}
+	if m.cfg.DefaultEgress != nil {
+		egress = sandbox.EgressInfo{
+			Enabled:   m.cfg.DefaultEgress.Enabled,
+			Mode:      m.cfg.DefaultEgress.Mode,
+			RuleCount: len(m.cfg.DefaultEgress.Rules),
+		}
+	}
+
+	snap := sandbox.SnapshotInfo{Enabled: m.cfg.UseSnapshot}
+	if m.vmm != nil && m.vmm.snapshot != nil {
+		snap.Ready = m.vmm.snapshot.Ready()
+	}
+
+	h := sandbox.Health{Runtime: rt, Pool: pool, Egress: egress, Snapshot: snap}
+	h.Ready = rt.KernelOK && rt.RootfsOK && rt.FCBinaryOK && rt.KVMAccessible
+	return h, nil
+}
+
+// fileReadable reports whether path exists and can be opened for reading.
+func fileReadable(path string) bool {
+	if path == "" {
+		return false
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	_ = f.Close()
+	return true
+}
+
+// fileExecutable reports whether path is a regular file with any execute bit set.
+func fileExecutable(path string) bool {
+	if path == "" {
+		return false
+	}
+	fi, err := os.Stat(path)
+	if err != nil || fi.IsDir() {
+		return false
+	}
+	return fi.Mode().Perm()&0o111 != 0
+}
+
+// kvmAccessible reports whether /dev/kvm exists and can be opened read-write.
+func kvmAccessible() bool {
+	f, err := os.OpenFile("/dev/kvm", os.O_RDWR, 0)
+	if err != nil {
+		return false
+	}
+	_ = f.Close()
+	return true
 }
