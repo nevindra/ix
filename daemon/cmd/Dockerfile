@@ -31,6 +31,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # uv (fast Python package installer — lets agents install packages at runtime)
 COPY --from=ghcr.io/astral-sh/uv:0.11.2 /uv /usr/local/bin/uv
 
+# Spreadsheet/tabular data libs baked in: sandboxes run with restricted egress,
+# so agents cannot pip-install these at runtime. Without them, xlsx generation
+# falls back to hand-rolled OOXML XML that strict parsers reject.
+RUN pip3 install --break-system-packages --no-cache-dir "openpyxl==3.1.*" "pandas==2.2.*"
+
 # Node.js — pinned tarball straight from nodejs.org into /usr/local, so
 # node/npm/npx land on the default PATH both in Docker AND inside VMs
 # (Docker ENV PATH does not survive into a Firecracker VM, and ix-code

@@ -6,6 +6,11 @@ Tags follow the Go module convention for the SDK (`go-sdk/vX.Y.Z`).
 
 ## [Unreleased]
 
+### Added
+
+- Base image bakes `openpyxl` and `pandas` so sandboxes can generate `.xlsx`
+  offline (restricted egress blocks runtime pip installs).
+
 ## [0.3.0] - 2026-06-16
 
 ### Added
