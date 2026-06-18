@@ -148,8 +148,8 @@ First tagged release.
 - SDK aligned with the Oasis sandbox contract; Go module renamed to
   `github.com/nevindra/ix/go-sdk`.
 
-[Unreleased]: https://github.com/nevindra/ix/compare/v0.3.2...HEAD
-[0.3.2]: https://github.com/nevindra/ix/compare/v0.3.1...v0.3.2
+[Unreleased]: https://github.com/nevindra/ix/compare/go-sdk/v0.3.2...HEAD
+[0.3.2]: https://github.com/nevindra/ix/compare/go-sdk/v0.3.0...go-sdk/v0.3.2
 [0.3.1]: https://github.com/nevindra/ix/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/nevindra/ix/compare/go-sdk/v0.2.0...go-sdk/v0.3.0
 [0.2.0]: https://github.com/nevindra/ix/compare/go-sdk/v0.1.1...go-sdk/v0.2.0
