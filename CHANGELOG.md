@@ -6,6 +6,25 @@ Tags follow the Go module convention for the SDK (`go-sdk/vX.Y.Z`).
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-06-18
+
+### Added
+
+- **`IXManager.Health()`** — a passive readiness snapshot (`sandbox.Health`)
+  covering runtime (kernel / rootfs / Firecracker-binary readability and
+  `/dev/kvm` access), pool state (configured / ready / active plus cumulative
+  restarts and failures), egress, and snapshot status. It reads only
+  already-tracked state — no VM is launched or mutated. Backed by new
+  cumulative `restartsTotal` / `failuresTotal` atomic counters that outlive
+  sandbox destruction (a current-map count would lose them).
+
+### Changed
+
+- **Adapted to oasis v0.21.0** — `IXSandbox.BrowserSnapshot` now returns
+  `sandbox.PageSnapshot` (renamed from `sandbox.BrowserSnapshot`), and
+  `sandbox.MCPRequest.Args` is now `json.RawMessage` (a raw JSON object)
+  instead of `map[string]any`. The oasis requirement is bumped to v0.21.0.
+
 ## [0.3.1] - 2026-06-17
 
 ### Added
@@ -129,7 +148,9 @@ First tagged release.
 - SDK aligned with the Oasis sandbox contract; Go module renamed to
   `github.com/nevindra/ix/go-sdk`.
 
-[Unreleased]: https://github.com/nevindra/ix/compare/go-sdk/v0.3.0...HEAD
+[Unreleased]: https://github.com/nevindra/ix/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/nevindra/ix/compare/v0.3.1...v0.3.2
+[0.3.1]: https://github.com/nevindra/ix/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/nevindra/ix/compare/go-sdk/v0.2.0...go-sdk/v0.3.0
 [0.2.0]: https://github.com/nevindra/ix/compare/go-sdk/v0.1.1...go-sdk/v0.2.0
 [0.1.1]: https://github.com/nevindra/ix/releases/tag/go-sdk/v0.1.1
