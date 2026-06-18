@@ -6,5 +6,3 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/nevindra/oasis v0.21.0
 )
-
-replace github.com/nevindra/oasis => /home/nezhifi/Development/llm/oasis

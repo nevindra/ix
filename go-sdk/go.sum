@@ -1,2 +1,4 @@
 github.com/google/uuid v1.6.0 h1:NIvaJDMOsjHA8n1jAhLSgzrAzy1Hgr+hNrb57e+94F0=
 github.com/google/uuid v1.6.0/go.mod h1:TIyPZe4MgqvfeYDBFedMoGGpEw/LqOeaOT+nhxU+yHo=
+github.com/nevindra/oasis v0.21.0 h1:Iidz/+QE4ARDTEeOho1YOEHjGOaEW+h4+jkv44NMvUU=
+github.com/nevindra/oasis v0.21.0/go.mod h1:NSerpr/dAQQeWMMLW7ZxjoBs4Z67Wygp7wQCx/9Fvno=

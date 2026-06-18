@@ -468,7 +468,7 @@ func TestIXSandboxMCPCall(t *testing.T) {
 	res, err := s.MCPCall(context.Background(), sandbox.MCPRequest{
 		Server: "test-server",
 		Tool:   "test-tool",
-		Args:   map[string]any{"key": "value"},
+		Args:   json.RawMessage(`{"key":"value"}`),
 	})
 	if err != nil {
 		t.Fatalf("MCPCall() returned error: %v", err)
