@@ -723,6 +723,15 @@ func (s *IXSandbox) GetEgress(ctx context.Context) (EgressPolicy, error) {
 	return policy, err
 }
 
+// GuestIP returns the VM's deterministic guest IP (e.g. 172.16.0.2), or an
+// error for vsock-only / not-yet-networked VMs.
+func (s *IXSandbox) GuestIP(ctx context.Context) (string, error) {
+	if s.vmm == nil || s.vmm.Net == nil {
+		return "", fmt.Errorf("guest IP unavailable (vsock-only or not started)")
+	}
+	return s.vmm.Net.guestIP, nil
+}
+
 // Close releases resources held by this sandbox instance.
 func (s *IXSandbox) Close() error {
 	s.closed.Store(1)

@@ -41,6 +41,15 @@ func TestDeriveVMNet(t *testing.T) {
 	}
 }
 
+func TestDeriveVMNet_GuestIP(t *testing.T) {
+	cases := map[int]string{0: "172.16.0.2", 1: "172.16.0.6", 2: "172.16.0.10"}
+	for idx, want := range cases {
+		if got := deriveVMNet(idx).guestIP; got != want {
+			t.Fatalf("deriveVMNet(%d).guestIP = %q, want %q", idx, got, want)
+		}
+	}
+}
+
 func TestForwardRule(t *testing.T) {
 	in := forwardRule("DOCKER-USER", "-i")
 	if got, want := strings.Join(in, " "), "DOCKER-USER -i ixtap+ -j ACCEPT"; got != want {
