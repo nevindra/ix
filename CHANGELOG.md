@@ -6,6 +6,25 @@ Tags follow the Go module convention for the SDK (`go-sdk/vX.Y.Z`).
 
 ## [Unreleased]
 
+### Changed
+
+- **Sandbox lifetime is now a sliding idle window instead of an absolute TTL.**
+  `ManagerConfig.DefaultTTL` (and `CreateOpts.TTL`) is refreshed on every
+  request, so a VM that keeps being used never expires; the reaper destroys a
+  sandbox only after it has been idle for the full window. Enables warm reuse
+  of a per-conversation sandbox across turns. Previously `expiresAt` was fixed
+  at creation and a long-lived conversation was reaped mid-life.
+
+### Added
+
+- **In-flight guard.** A sandbox with an active request is never idle-reaped
+  and never health-restarted — a VM serving an exec is alive by definition,
+  even when a CPU-bound task starves its `/health` endpoint. Fixes spurious
+  mid-task restarts of busy sandboxes.
+- **Tunable health monitor** via `ManagerConfig.HealthInterval` (default 10s),
+  `HealthTimeout` (default 5s, was a hardcoded 3s), and
+  `HealthFailureThreshold` (default 3).
+
 ## [0.3.2] - 2026-06-18
 
 ### Added
