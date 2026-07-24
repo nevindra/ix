@@ -6,6 +6,8 @@ Tags follow the Go module convention for the SDK (`go-sdk/vX.Y.Z`).
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-07-24
+
 ### Changed
 
 - **Sandbox lifetime is now a sliding idle window instead of an absolute TTL.**
@@ -167,7 +169,8 @@ First tagged release.
 - SDK aligned with the Oasis sandbox contract; Go module renamed to
   `github.com/nevindra/ix/go-sdk`.
 
-[Unreleased]: https://github.com/nevindra/ix/compare/go-sdk/v0.3.2...HEAD
+[Unreleased]: https://github.com/nevindra/ix/compare/go-sdk/v0.3.3...HEAD
+[0.3.3]: https://github.com/nevindra/ix/compare/go-sdk/v0.3.2...go-sdk/v0.3.3
 [0.3.2]: https://github.com/nevindra/ix/compare/go-sdk/v0.3.0...go-sdk/v0.3.2
 [0.3.1]: https://github.com/nevindra/ix/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/nevindra/ix/compare/go-sdk/v0.2.0...go-sdk/v0.3.0
