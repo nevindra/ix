@@ -35,8 +35,8 @@ func (m *IXManager) reapExpired(ctx context.Context) {
 
 	now := time.Now()
 	for sessionID, sb := range snapshot {
-		if now.After(sb.expiresAt) {
-			m.logger.Info("reaper: TTL expired, destroying", "session", sessionID)
+		if sb.idle(now) {
+			m.logger.Info("reaper: idle timeout, destroying", "session", sessionID)
 			if err := m.destroy(ctx, sessionID); err != nil {
 				m.logger.Warn("reaper: destroy failed", "session", sessionID, "error", err)
 			}

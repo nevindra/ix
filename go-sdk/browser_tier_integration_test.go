@@ -44,7 +44,11 @@ func TestBrowserTierEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create browser sandbox: %v", err)
 	}
-	if err := sb.BrowserNavigate(ctx, "https://example.com"); err != nil {
+	bsb, ok := sb.(sandbox.BrowserSandbox)
+	if !ok {
+		t.Fatal("browser-enabled sandbox does not implement sandbox.BrowserSandbox")
+	}
+	if err := bsb.BrowserNavigate(ctx, "https://example.com"); err != nil {
 		t.Fatalf("navigate via shared tier: %v", err)
 	}
 

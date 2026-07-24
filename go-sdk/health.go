@@ -16,7 +16,7 @@ import (
 // monitor periodically health-checks every sandbox and restarts or marks
 // failed those that exceed the consecutive failure threshold.
 func (m *IXManager) monitor(ctx context.Context) {
-	ticker := time.NewTicker(10 * time.Second)
+	ticker := time.NewTicker(m.cfg.HealthInterval)
 	defer ticker.Stop()
 
 	for {
@@ -29,7 +29,9 @@ func (m *IXManager) monitor(ctx context.Context) {
 			m.mu.RUnlock()
 
 			for sessionID, sb := range snapshot {
-				if sb.healthCheck(ctx) {
+				// A VM with an in-flight request is alive by definition; a
+				// CPU-bound task can starve /health, so never restart it mid-work.
+				if sb.inflight.Load() > 0 || sb.healthCheck(ctx, m.cfg.HealthTimeout) {
 					m.mu.Lock()
 					if cur, ok := m.sandboxes[sessionID]; ok {
 						cur.failCount = 0
@@ -49,7 +51,7 @@ func (m *IXManager) monitor(ctx context.Context) {
 				restartCount := cur.restartCount
 				m.mu.Unlock()
 
-				if failCount >= 3 {
+				if failCount >= m.cfg.HealthFailureThreshold {
 					if restartCount < m.cfg.MaxRestarts {
 						m.restart(ctx, sessionID)
 					} else {
@@ -72,9 +74,10 @@ func (m *IXManager) restart(ctx context.Context, sessionID string) {
 	}
 	oldVMM := old.vmm
 	oldRestartCount := old.restartCount
-	remainingTTL := time.Until(old.expiresAt)
-	if remainingTTL < 0 {
-		remainingTTL = 0
+	idleTTL := old.idleTTL
+	remainingIdle := time.Until(time.Unix(0, old.idleDeadline.Load()))
+	if remainingIdle < 0 {
+		remainingIdle = 0
 	}
 	m.mu.Unlock()
 
@@ -119,10 +122,11 @@ func (m *IXManager) restart(ctx context.Context, sessionID string) {
 		baseURL:      "http://localhost",
 		client:       newClient("http://localhost", httpClient),
 		createdAt:    now,
-		expiresAt:    now.Add(remainingTTL),
+		idleTTL:      idleTTL,
 		restartCount: oldRestartCount + 1,
 		shellSession: "default",
 	}
+	newSb.idleDeadline.Store(now.Add(remainingIdle).UnixNano())
 
 	m.mu.Lock()
 	m.sandboxes[sessionID] = newSb

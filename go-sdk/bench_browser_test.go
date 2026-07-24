@@ -76,15 +76,16 @@ func browserBenchEnv(b *testing.B) (*IXManager, string) {
 
 // browserBenchSandbox creates one browser-enabled sandbox and navigates it
 // once so per-op benchmarks measure steady-state (instance + tab exist).
-func browserBenchSandbox(b *testing.B, mgr *IXManager, pageURL, sid string) sandbox.Sandbox {
+func browserBenchSandbox(b *testing.B, mgr *IXManager, pageURL, sid string) *IXSandbox {
 	b.Helper()
 	ctx := context.Background()
 	yes := true
-	sb, err := mgr.Create(ctx, sandbox.CreateOpts{SessionID: sid, Browser: &yes})
+	raw, err := mgr.Create(ctx, sandbox.CreateOpts{SessionID: sid, Browser: &yes})
 	if err != nil {
 		b.Fatal(err)
 	}
-	b.Cleanup(func() { _ = mgr.Destroy(context.Background(), sb.(*IXSandbox).id) })
+	sb := raw.(*IXSandbox) // browser methods are on the concrete type / BrowserSandbox, not sandbox.Sandbox
+	b.Cleanup(func() { _ = mgr.Destroy(context.Background(), sb.id) })
 	if err := sb.BrowserNavigate(ctx, pageURL); err != nil {
 		b.Fatalf("warmup navigate: %v", err)
 	}
@@ -159,12 +160,11 @@ func BenchmarkBrowserEval(b *testing.B) {
 	ctx := context.Background()
 	mgr, pageURL := browserBenchEnv(b)
 	sb := browserBenchSandbox(b, mgr, pageURL, "bench-br-eval")
-	ix := sb.(*IXSandbox)
 
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if _, err := ix.BrowserEval(ctx, "1+1"); err != nil {
+		if _, err := sb.BrowserEval(ctx, "1+1"); err != nil {
 			b.Fatalf("BrowserEval: %v", err)
 		}
 	}
@@ -184,10 +184,11 @@ func BenchmarkBrowserFirstUse(b *testing.B) {
 		b.StopTimer()
 		waitPoolFill(mgr, 1)
 		sid := fmt.Sprintf("bench-br-first-%d", i)
-		sb, err := mgr.Create(ctx, sandbox.CreateOpts{SessionID: sid, Browser: &yes})
+		raw, err := mgr.Create(ctx, sandbox.CreateOpts{SessionID: sid, Browser: &yes})
 		if err != nil {
 			b.Fatalf("Create: %v", err)
 		}
+		sb := raw.(*IXSandbox)
 		b.StartTimer()
 
 		if err := sb.BrowserNavigate(ctx, pageURL); err != nil {
@@ -195,7 +196,7 @@ func BenchmarkBrowserFirstUse(b *testing.B) {
 		}
 
 		b.StopTimer()
-		if err := mgr.Destroy(ctx, sb.(*IXSandbox).id); err != nil {
+		if err := mgr.Destroy(ctx, sb.id); err != nil {
 			b.Fatalf("Destroy: %v", err)
 		}
 		b.StartTimer()
@@ -217,18 +218,18 @@ func BenchmarkBrowserE2E(b *testing.B) {
 		b.StartTimer()
 
 		sid := fmt.Sprintf("bench-br-e2e-%d", i)
-		sb, err := mgr.Create(ctx, sandbox.CreateOpts{SessionID: sid, Browser: &yes})
+		raw, err := mgr.Create(ctx, sandbox.CreateOpts{SessionID: sid, Browser: &yes})
 		if err != nil {
 			b.Fatalf("Create: %v", err)
 		}
-		ix := sb.(*IXSandbox)
-		if err := sb.BrowserNavigate(ctx, pageURL); err != nil {
+		ix := raw.(*IXSandbox)
+		if err := ix.BrowserNavigate(ctx, pageURL); err != nil {
 			b.Fatalf("BrowserNavigate: %v", err)
 		}
-		if _, err := sb.BrowserSnapshot(ctx, sandbox.SnapshotOpts{}); err != nil {
+		if _, err := ix.BrowserSnapshot(ctx, sandbox.SnapshotOpts{}); err != nil {
 			b.Fatalf("BrowserSnapshot: %v", err)
 		}
-		if _, err := sb.BrowserAction(ctx, sandbox.BrowserAction{Type: "click", X: 100, Y: 100}); err != nil {
+		if _, err := ix.BrowserAction(ctx, sandbox.BrowserAction{Type: "click", X: 100, Y: 100}); err != nil {
 			b.Fatalf("BrowserAction: %v", err)
 		}
 		if _, err := ix.BrowserText(ctx, sandbox.TextOpts{}); err != nil {

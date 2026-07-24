@@ -31,9 +31,18 @@ type ManagerConfig struct {
 	KernelPath        string        // path to vmlinux kernel (required)
 	FCBinary          string        // path to firecracker binary; empty searches PATH
 	MaxConcurrent     int           // 0 = auto-detect from host resources
-	DefaultTTL        time.Duration // default: 1 hour
+	DefaultTTL        time.Duration // idle timeout: VM reaped after this long with no requests; refreshed on every request (default: 1 hour)
 	PerSandbox        ResourceSpec  // per-VM resource limits
 	MaxRestarts       int           // default: 3
+
+	// Health monitor tunables. A busy VM (in-flight request) is skipped
+	// entirely — it is alive by definition even if a CPU-bound task starves
+	// its /health endpoint — so these only bound detection of a genuinely
+	// wedged idle VM.
+	HealthInterval         time.Duration // poll period (default: 10s)
+	HealthTimeout          time.Duration // per-check /health timeout (default: 5s)
+	HealthFailureThreshold int           // consecutive failures before restart (default: 3)
+
 	Logger            *slog.Logger
 	DefaultEgress     *EgressPolicy // optional default egress policy applied to all sandboxes
 	PoolSize          int           // number of VMs to keep pre-warmed (default: 0 = disabled)
@@ -103,6 +112,15 @@ func (c *ManagerConfig) applyDefaults() {
 	}
 	if c.MaxRestarts == 0 {
 		c.MaxRestarts = 3
+	}
+	if c.HealthInterval == 0 {
+		c.HealthInterval = 10 * time.Second
+	}
+	if c.HealthTimeout == 0 {
+		c.HealthTimeout = 5 * time.Second
+	}
+	if c.HealthFailureThreshold == 0 {
+		c.HealthFailureThreshold = 3
 	}
 	if c.Logger == nil {
 		c.Logger = slog.Default()
@@ -455,9 +473,10 @@ func (m *IXManager) Create(ctx context.Context, opts sandbox.CreateOpts) (sandbo
 			baseURL:      "http://localhost",
 			client:       newClient("http://localhost", poolClient),
 			createdAt:    now,
-			expiresAt:    now.Add(ttl),
+			idleTTL:      ttl,
 			shellSession: "default",
 		}
+		sb.touch()
 
 		m.mu.Lock()
 		m.sandboxes[resolved.SessionID] = sb
@@ -525,9 +544,10 @@ func (m *IXManager) Create(ctx context.Context, opts sandbox.CreateOpts) (sandbo
 		baseURL:      "http://localhost",
 		client:       newClient("http://localhost", httpClient),
 		createdAt:    now,
-		expiresAt:    now.Add(ttl),
+		idleTTL:      ttl,
 		shellSession: "default",
 	}
+	sb.touch()
 
 	m.mu.Lock()
 	m.sandboxes[resolved.SessionID] = sb
@@ -744,7 +764,7 @@ func (m *IXManager) evictIdle(ctx context.Context) bool {
 	var oldestSID string
 	now := time.Now()
 	for sid, sb := range m.sandboxes {
-		if now.After(sb.expiresAt) {
+		if sb.idle(now) {
 			if oldest == nil || sb.createdAt.Before(oldest.createdAt) {
 				oldest = sb
 				oldestSID = sid

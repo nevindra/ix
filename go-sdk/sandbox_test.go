@@ -254,8 +254,9 @@ func newTestSandbox(t *testing.T) (*IXSandbox, *httptest.Server) {
 		baseURL:   srv.URL,
 		client:    newClient(srv.URL, srv.Client()),
 		createdAt: time.Now(),
-		expiresAt: time.Now().Add(time.Hour),
+		idleTTL:   time.Hour,
 	}
+	s.touch()
 	return s, srv
 }
 
@@ -547,7 +548,7 @@ func TestIXSandboxClosedError(t *testing.T) {
 func TestIXSandboxHealthCheck(t *testing.T) {
 	s, _ := newTestSandbox(t)
 
-	ok := s.healthCheck(context.Background())
+	ok := s.healthCheck(context.Background(), 3*time.Second)
 	if !ok {
 		t.Error("expected healthCheck to return true")
 	}

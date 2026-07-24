@@ -22,7 +22,9 @@ type IXSandbox struct {
 	baseURL      string
 	client       *ixClient
 	createdAt    time.Time
-	expiresAt    time.Time
+	idleTTL      time.Duration // sliding idle window; VM reaped after this long with no activity
+	idleDeadline atomic.Int64  // unixnano; refreshed on every request so an active VM is never reaped
+	inflight     atomic.Int32  // in-flight requests; a busy VM must not be idle-reaped or health-restarted
 	failCount    int
 	restartCount int
 	closed       atomic.Int32
@@ -31,6 +33,29 @@ type IXSandbox struct {
 
 // errClosed is returned when a method is called on a closed sandbox.
 var errClosed = fmt.Errorf("sandbox closed")
+
+// touch pushes the idle deadline out by idleTTL from now. Called on every
+// request boundary so a conversation that keeps using its sandbox stays warm.
+func (s *IXSandbox) touch() {
+	s.idleDeadline.Store(time.Now().Add(s.idleTTL).UnixNano())
+}
+
+// activity marks a request in-flight and returns a done func to defer. While
+// in-flight the VM is never idle-reaped or health-restarted (it is alive by
+// definition, even if a CPU-bound task starves the /health endpoint).
+func (s *IXSandbox) activity() func() {
+	s.inflight.Add(1)
+	s.touch()
+	return func() {
+		s.touch()
+		s.inflight.Add(-1)
+	}
+}
+
+// idle reports whether the VM has no in-flight work and its idle deadline passed.
+func (s *IXSandbox) idle(now time.Time) bool {
+	return s.inflight.Load() == 0 && now.UnixNano() > s.idleDeadline.Load()
+}
 
 func (s *IXSandbox) checkClosed() error {
 	if s.closed.Load() != 0 {
@@ -46,6 +71,7 @@ func (s *IXSandbox) Shell(ctx context.Context, req sandbox.ShellRequest) (sandbo
 	if err := s.checkClosed(); err != nil {
 		return sandbox.ShellResult{}, err
 	}
+	defer s.activity()()
 	body := map[string]any{
 		"command":    req.Command,
 		"session_id": s.shellSession, // reuse persistent bash session
@@ -66,6 +92,7 @@ func (s *IXSandbox) ShellOneShot(ctx context.Context, req sandbox.ShellRequest) 
 	if err := s.checkClosed(); err != nil {
 		return sandbox.ShellResult{}, err
 	}
+	defer s.activity()()
 	body := map[string]any{
 		"command": req.Command,
 		// No session_id — daemon will fork+exec a fresh shell.
@@ -123,6 +150,7 @@ func (s *IXSandbox) ExecCode(ctx context.Context, req sandbox.CodeRequest) (sand
 	if err := s.checkClosed(); err != nil {
 		return sandbox.CodeResult{}, err
 	}
+	defer s.activity()()
 	body := map[string]any{
 		"language": req.Language,
 		"code":     req.Code,
@@ -195,6 +223,7 @@ func (s *IXSandbox) ReadFile(ctx context.Context, req sandbox.ReadFileRequest) (
 	if err := s.checkClosed(); err != nil {
 		return sandbox.FileContent{}, err
 	}
+	defer s.activity()()
 	body := map[string]any{
 		"path": req.Path,
 	}
@@ -224,6 +253,7 @@ func (s *IXSandbox) WriteFile(ctx context.Context, req sandbox.WriteFileRequest)
 	if err := s.checkClosed(); err != nil {
 		return err
 	}
+	defer s.activity()()
 	body := map[string]string{
 		"path":    req.Path,
 		"content": req.Content,
@@ -242,6 +272,7 @@ func (s *IXSandbox) UploadFile(ctx context.Context, path string, data io.Reader)
 	if err := s.checkClosed(); err != nil {
 		return err
 	}
+	defer s.activity()()
 	if err := s.client.upload(ctx, "/v1/file/upload", path, data); err != nil {
 		return fmt.Errorf("upload file: %w", err)
 	}
@@ -253,6 +284,7 @@ func (s *IXSandbox) DownloadFile(ctx context.Context, path string) (io.ReadClose
 	if err := s.checkClosed(); err != nil {
 		return nil, err
 	}
+	defer s.activity()()
 	rc, err := s.client.getRaw(ctx, "/v1/file/download?path="+url.QueryEscape(path))
 	if err != nil {
 		return nil, fmt.Errorf("download file: %w", err)
@@ -480,6 +512,7 @@ func (s *IXSandbox) HTTPFetch(ctx context.Context, req sandbox.HTTPFetchRequest)
 	if err := s.checkClosed(); err != nil {
 		return sandbox.HTTPFetchResult{}, err
 	}
+	defer s.activity()()
 	body := map[string]any{
 		"url": req.URL,
 	}
@@ -731,8 +764,8 @@ func (s *IXSandbox) Close() error {
 
 // healthCheck checks if the ix daemon is responding.
 // Returns true if the health endpoint returns HTTP 200 within 3 seconds.
-func (s *IXSandbox) healthCheck(ctx context.Context) bool {
-	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+func (s *IXSandbox) healthCheck(ctx context.Context, timeout time.Duration) bool {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.baseURL+"/health", nil)
