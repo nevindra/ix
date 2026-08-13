@@ -6,6 +6,67 @@ Tags follow the Go module convention for the SDK (`go-sdk/vX.Y.Z`).
 
 ## [Unreleased]
 
+### Added
+
+- **`POST /v1/file/hash` — sha256 inside the VM, so a host can tell what changed
+  without moving it.** A host that mirrors the workspace into storage has to
+  answer "which of these files must I pull back out?", and the only way to
+  answer it was to download every file and hash it on the far side of the
+  vsock — the full byte size of the workspace moved to discover that nothing
+  changed. The route takes `{"paths": [...]}` and returns
+  `{"hashes": [{"path", "hash", "size"}]}`, where `hash` is the lower-case hex
+  sha256 and `size` is the length actually digested, counted while hashing
+  rather than stat'd separately, so the two always describe the same read even
+  if the file is rewritten the instant afterwards.
+
+  Each file is streamed through a fixed 64 KB window, reused across every path
+  in the batch, so hashing a multi-hundred-megabyte dataset costs the same
+  memory as hashing a README. That is the constraint that shaped it: a sandbox
+  VM's RAM budget is a few hundred megabytes and its workspace is allowed to be
+  larger than that.
+
+  **Best-effort, and it answers 200 either way.** A path that is missing,
+  unreadable, or a directory is omitted from `hashes` rather than failing the
+  call: the caller enumerated these paths a moment ago while a command was
+  still writing to the workspace, so a file that has since been deleted is the
+  ordinary case, and one vanished temp file must not cost it the digests of
+  everything else. Match results by `path` and read an absent path as
+  *unknown*, never as *unchanged*. Results follow request order.
+
+  sha256 comes from `ring`, which rustls and hickory-proto already pull into
+  every `ixd` build — no new crate, no new musl build surface.
+
+- **`IXSandbox.HashFiles` implements oasis's `sandbox.FileHasher`.** oasis
+  declares hashing as an optional capability beside `Sandbox`, detected by type
+  assertion (`sandbox.AsFileHasher`), so a runtime that cannot hash degrades to
+  downloading the bytes. ix can, which is what lets oasis's stat-and-hash change
+  detector and its close-time flush skip files the backend already holds without
+  transferring a single one of them. Needs an oasis that declares `FileHasher`
+  and `GlobResult.Entries`.
+
+- **`/v1/file/glob` now describes the files it lists.** The response gains
+  `entries` — one `{path, size, mod_time, mod_time_nanos}` per hit, stat'd
+  inside the VM in the round trip that already returned the names. Size plus
+  mtime rules out most files as untouched before anything is hashed, let alone
+  transferred. `files` and `truncated` are unchanged and the field is additive,
+  so an older client sees exactly what it saw before.
+
+  `mod_time` is RFC 3339 at second resolution; `mod_time_nanos` is nanoseconds
+  since the Unix epoch, and it is the field that carries the information. An
+  agent rewrites a file twice inside one second routinely, so a second-granular
+  mtime cannot separate two versions of the same byte length, and a host
+  comparing on it alone would take a real change for an unchanged file.
+
+  `entries` is **not** index-aligned with `files`: a path the daemon could not
+  stat stays in `files` and simply has no entry. Leaving it there says "found,
+  but undescribed", which a caller can act on; dropping it would say "gone",
+  which is a different and worse claim. Match on `path`.
+
+  The Go SDK parses this into `sandbox.GlobResult.Entries`, preferring
+  `mod_time_nanos` whenever the daemon reported it and falling back to parsing
+  `mod_time`. A timestamp it cannot parse is left as the zero time, because an
+  unknown mtime is safe — the caller hashes the file — and a wrong one is not.
+
 ## [0.3.3] - 2026-07-24
 
 ### Changed

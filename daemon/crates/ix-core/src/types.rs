@@ -64,10 +64,55 @@ pub struct GlobRequest {
     pub limit: Option<usize>,
 }
 
+/// A globbed path the daemon could also describe.
+///
+/// Exists so a host can tell which files changed without pulling their contents
+/// back over vsock: size plus mtime rules out most files, and only the survivors
+/// need hashing.
+#[derive(Debug, Serialize)]
+pub struct GlobEntry {
+    pub path: String,
+    pub size: u64,
+    /// RFC 3339, second resolution.
+    pub mod_time: String,
+    /// Nanoseconds since the Unix epoch. Full precision, and the field that
+    /// matters: an agent rewrites a file twice inside one second routinely,
+    /// so a second-granular mtime cannot separate two versions of the same
+    /// byte length and the host would take a real change for an unchanged file.
+    pub mod_time_nanos: u64,
+}
+
 #[derive(Debug, Serialize)]
 pub struct GlobResult {
     pub files: Vec<String>,
+    /// Descriptions of the paths in `files` that could be stat'd. Not
+    /// index-aligned with `files` — a path the daemon failed to stat is still
+    /// listed there but has no entry here, so callers match on `path`.
+    pub entries: Vec<GlobEntry>,
     pub truncated: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct HashRequest {
+    pub paths: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FileHash {
+    pub path: String,
+    /// Lower-case hex sha256.
+    pub hash: String,
+    /// Byte length the digest covers, counted while hashing rather than
+    /// stat'd separately, so the two always describe the same read.
+    pub size: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct HashResult {
+    /// One per readable file, in request order. Paths that were missing,
+    /// unreadable, or directories are simply absent — see `ix_files::hash_files`
+    /// for why that is a success and not an error.
+    pub hashes: Vec<FileHash>,
 }
 
 #[derive(Debug, Deserialize)]

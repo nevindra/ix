@@ -1,5 +1,9 @@
+use crate::stat::{format_system_time, unix_nanos};
 use ix_core::{
-    types::{GlobRequest, GlobResult, GrepMatch, GrepRequest, GrepResult, TreeRequest, TreeResult},
+    types::{
+        GlobEntry, GlobRequest, GlobResult, GrepMatch, GrepRequest, GrepResult, TreeRequest,
+        TreeResult,
+    },
     Error, Result,
 };
 use regex::Regex;
@@ -57,7 +61,8 @@ async fn try_fd_glob(
         .map(|l| l.to_string())
         .collect();
     let truncated = files.len() >= limit;
-    Some(GlobResult { files, truncated })
+    let entries = describe(&files);
+    Some(GlobResult { files, entries, truncated })
 }
 
 fn native_glob(
@@ -96,7 +101,32 @@ fn native_glob(
         }
     }
 
-    Ok(GlobResult { files, truncated })
+    let entries = describe(&files);
+    Ok(GlobResult { files, entries, truncated })
+}
+
+/// Stat every hit so the caller gets size + mtime alongside the names.
+///
+/// A path that will not stat is skipped rather than dropped from `files` or
+/// escalated into an error: it was on disk a moment ago, the glob is racing
+/// whatever is writing to the workspace, and one unreadable path must not cost
+/// the caller the other 999. Leaving it in `files` with no entry says "here,
+/// but undescribed", which a caller can act on; removing it would say "gone",
+/// which is a different and worse claim.
+fn describe(files: &[String]) -> Vec<GlobEntry> {
+    files
+        .iter()
+        .filter_map(|path| {
+            let meta = std::fs::metadata(path).ok()?;
+            let modified = meta.modified().ok()?;
+            Some(GlobEntry {
+                path: path.clone(),
+                size: meta.len(),
+                mod_time: format_system_time(modified),
+                mod_time_nanos: unix_nanos(modified),
+            })
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -508,6 +538,95 @@ mod tests {
         // The actual files list should not exceed 3 (we break when we hit limit)
         assert!(result.files.len() <= 3);
         assert!(result.truncated);
+    }
+
+    #[tokio::test]
+    async fn glob_describes_each_file_it_lists() {
+        let dir = TempDir::new().unwrap();
+        create_file(&dir, "one.rs", "abc"); // 3 bytes
+        create_file(&dir, "two.rs", "abcdefgh"); // 8 bytes
+
+        let result = glob_files(glob_req("*.rs", dir.path().to_str().unwrap(), None, None))
+            .await
+            .unwrap();
+
+        assert_eq!(result.files.len(), 2);
+        assert_eq!(result.entries.len(), 2);
+
+        for (name, size) in [("one.rs", 3u64), ("two.rs", 8u64)] {
+            let entry = result
+                .entries
+                .iter()
+                .find(|e| e.path.ends_with(name))
+                .unwrap_or_else(|| panic!("no entry for {name}: {:?}", result.entries));
+            assert_eq!(entry.size, size);
+            assert!(
+                entry.mod_time.starts_with("20") && entry.mod_time.ends_with('Z'),
+                "mod_time should be RFC 3339 UTC: {}",
+                entry.mod_time
+            );
+            assert!(entry.mod_time_nanos > 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn glob_entries_are_matched_to_files_by_path() {
+        let dir = TempDir::new().unwrap();
+        create_file(&dir, "a.rs", "");
+        create_file(&dir, "b.rs", "");
+        create_file(&dir, "c.txt", "");
+
+        let result = glob_files(glob_req("*.rs", dir.path().to_str().unwrap(), None, None))
+            .await
+            .unwrap();
+
+        // `files` keeps its old meaning: every name, nothing else.
+        assert_eq!(result.files.len(), 2);
+        assert!(result.files.iter().all(|f| f.ends_with(".rs")));
+
+        // `entries` never names a path that isn't in `files`.
+        assert!(
+            result.entries.iter().all(|e| result.files.contains(&e.path)),
+            "entries: {:?} files: {:?}",
+            result.entries,
+            result.files
+        );
+    }
+
+    #[tokio::test]
+    async fn native_glob_describes_its_hits_too() {
+        // glob_files prefers fd wherever it is installed, so the walkdir
+        // fallback needs its own call or it goes untested on most machines.
+        let dir = TempDir::new().unwrap();
+        create_file(&dir, "only.rs", "abcd"); // 4 bytes
+
+        let result = native_glob("*.rs", dir.path().to_str().unwrap(), &[], 100).unwrap();
+
+        assert_eq!(result.files.len(), 1);
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.entries[0].path, result.files[0]);
+        assert_eq!(result.entries[0].size, 4);
+        assert!(result.entries[0].mod_time_nanos > 0);
+    }
+
+    #[tokio::test]
+    async fn describe_skips_what_it_cannot_stat_and_keeps_the_rest() {
+        // The delete-during-glob race, forced: a path that was listed and is
+        // gone by the time it is stat'd yields no entry, and does not take the
+        // rest of the batch with it.
+        let dir = TempDir::new().unwrap();
+        let real = create_file(&dir, "real.rs", "x");
+        let gone = dir.path().join("gone.rs");
+
+        let files = vec![
+            gone.to_str().unwrap().to_string(),
+            real.to_str().unwrap().to_string(),
+        ];
+        let entries = describe(&files);
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, real.to_str().unwrap());
+        assert_eq!(entries[0].size, 1);
     }
 
     // -----------------------------------------------------------------------

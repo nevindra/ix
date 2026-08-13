@@ -1094,6 +1094,7 @@ dependencies = [
  "glob",
  "ix-core",
  "regex",
+ "ring",
  "serde",
  "serde_json",
  "tempfile",

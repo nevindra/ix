@@ -83,7 +83,7 @@ ix-server (binary: ixd)
 ├── ix-core      shared types, config, error→HTTP mapping, SSE primitives
 ├── ix-shell     bash with streaming, timeouts, process-group cleanup
 ├── ix-code      Python/JS/Bash REPL over a stdin/stdout sentinel protocol
-├── ix-files     read / write / edit / glob / grep / tree / stat / upload / download
+├── ix-files     read / write / edit / glob / grep / tree / stat / hash / upload / download
 ├── ix-fetch     HTTP fetch (raw or readable text) + web search
 ├── ix-egress    DNS-level egress firewall (allow/deny, wildcard domains)
 └── ix-browser   headless Chrome via Pinchtab (navigate/screenshot/snapshot/PDF/…)

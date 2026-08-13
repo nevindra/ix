@@ -428,11 +428,76 @@ func (s *IXSandbox) GlobFiles(ctx context.Context, req sandbox.GlobRequest) (san
 	var resp struct {
 		Files     []string `json:"files"`
 		Truncated bool     `json:"truncated"`
+		Entries   []struct {
+			Path         string `json:"path"`
+			Size         int64  `json:"size"`
+			ModTime      string `json:"mod_time"`
+			ModTimeNanos int64  `json:"mod_time_nanos"`
+		} `json:"entries"`
 	}
 	if err := s.client.post(ctx, "/v1/file/glob", body, &resp); err != nil {
 		return sandbox.GlobResult{}, fmt.Errorf("glob files: %w", err)
 	}
-	return sandbox.GlobResult{Files: resp.Files, Truncated: resp.Truncated}, nil
+
+	// Entries is additive: a daemon that predates the metadata protocol omits
+	// the field entirely, which unmarshals to a nil resp.Entries and leaves
+	// the result's Entries nil too — nothing else about Files/Truncated
+	// changes for that case.
+	var entries []sandbox.GlobEntry
+	if len(resp.Entries) > 0 {
+		entries = make([]sandbox.GlobEntry, len(resp.Entries))
+		for i, e := range resp.Entries {
+			entry := sandbox.GlobEntry{Path: e.Path, Size: e.Size}
+			switch {
+			case e.ModTimeNanos != 0:
+				// Sub-second precision is the entire point of this field —
+				// prefer it whenever the daemon reported it.
+				entry.ModTime = time.Unix(0, e.ModTimeNanos).UTC()
+			case e.ModTime != "":
+				if t, err := time.Parse(time.RFC3339, e.ModTime); err == nil {
+					entry.ModTime = t.UTC()
+				}
+				// Parse failure leaves ModTime as the zero value: a wrong
+				// timestamp is worse than an "unknown" one.
+			}
+			entries[i] = entry
+		}
+	}
+
+	return sandbox.GlobResult{Files: resp.Files, Truncated: resp.Truncated, Entries: entries}, nil
+}
+
+// HashFiles computes the sha256 of each path's current content inside the
+// guest. It implements sandbox.FileHasher.
+func (s *IXSandbox) HashFiles(ctx context.Context, paths []string) ([]sandbox.FileHash, error) {
+	if err := s.checkClosed(); err != nil {
+		return nil, err
+	}
+	if len(paths) == 0 {
+		return nil, nil
+	}
+	body := map[string]any{
+		"paths": paths,
+	}
+	var resp struct {
+		Hashes []struct {
+			Path string `json:"path"`
+			Hash string `json:"hash"`
+			Size int64  `json:"size"`
+		} `json:"hashes"`
+	}
+	if err := s.client.post(ctx, "/v1/file/hash", body, &resp); err != nil {
+		return nil, fmt.Errorf("hash files: %w", err)
+	}
+
+	// The daemon omits paths it could not read; pass that through as-is. The
+	// caller matches results by Path, not position, and a missing path means
+	// unknown rather than unchanged.
+	hashes := make([]sandbox.FileHash, len(resp.Hashes))
+	for i, h := range resp.Hashes {
+		hashes[i] = sandbox.FileHash{Path: h.Path, Digest: h.Hash, Size: h.Size}
+	}
+	return hashes, nil
 }
 
 // GrepFiles searches file contents for a regex pattern.
@@ -782,3 +847,4 @@ func (s *IXSandbox) healthCheck(ctx context.Context, timeout time.Duration) bool
 
 // Compile-time interface check.
 var _ sandbox.Sandbox = (*IXSandbox)(nil)
+var _ sandbox.FileHasher = (*IXSandbox)(nil)

@@ -33,17 +33,6 @@ type Sandbox interface {
     HTTPFetch(ctx context.Context, req HTTPFetchRequest) (HTTPFetchResult, error)
     WebSearch(ctx context.Context, req WebSearchRequest) (WebSearchResult, error)
 
-    // --- Browser ---
-    BrowserNavigate(ctx context.Context, url string) error
-    BrowserScreenshot(ctx context.Context) ([]byte, error)
-    BrowserAction(ctx context.Context, action BrowserAction) (BrowserResult, error)
-    BrowserSnapshot(ctx context.Context, opts SnapshotOpts) (BrowserSnapshot, error)
-    BrowserText(ctx context.Context, opts TextOpts) (BrowserTextResult, error)
-    BrowserPDF(ctx context.Context) ([]byte, error)
-    BrowserEval(ctx context.Context, expression string) (string, error)
-    BrowserFind(ctx context.Context, query string) (BrowserFindResult, error)
-    BrowserWait(ctx context.Context, opts BrowserWaitOpts) (BrowserWaitResult, error)
-
     // --- MCP ---
     MCPCall(ctx context.Context, req MCPRequest) (MCPResult, error)
 
@@ -53,7 +42,24 @@ type Sandbox interface {
 }
 ```
 
-That is the complete interface — 23 methods, grouped by concern. Any `Sandbox` value satisfying this contract could be backed by Firecracker, Docker, a mock for testing, or anything else. Your app code stays the same regardless.
+That is the complete core interface — 15 methods, grouped by concern. Any `Sandbox` value satisfying it could be backed by Firecracker, Docker, a mock for testing, or anything else. Your app code stays the same regardless.
+
+**Optional capabilities.** oasis declares interfaces *beside* `Sandbox` that an implementation may also satisfy, detected by type assertion so that adding one breaks nobody. `IXSandbox` implements two.
+
+`sandbox.BrowserSandbox` — the nine `Browser*` methods (`BrowserNavigate`, `BrowserScreenshot`, `BrowserAction`, `BrowserSnapshot`, `BrowserText`, `BrowserPDF`, `BrowserEval`, `BrowserFind`, `BrowserWait`). They were part of `Sandbox` until oasis v1.0.0 prep moved them out, so a runtime with no browser is no longer forced to stub nine methods that cannot work. `BrowserSnapshot` returns `sandbox.PageSnapshot` (renamed from `BrowserSnapshot` in ix 0.3.2 — the method and the type no longer share a name).
+
+> One wrinkle worth knowing if you gate tools on this: `IXSandbox` defines all nine unconditionally, so it satisfies `BrowserSandbox` even when the deployment has no browser tier and every call is a guaranteed 503 from the guest. The capability assertion tells you the methods exist, not that they work — check your own browser-mode config as well.
+
+`sandbox.FileHasher`:
+
+```go
+// oasis detects this with sandbox.AsFileHasher(sb).
+HashFiles(ctx context.Context, paths []string) ([]sandbox.FileHash, error)
+```
+
+`HashFiles` returns the lower-case hex sha256 of each path, computed **inside the VM** — one round trip for any number of files, a few dozen bytes each, and no file contents crossing the vsock. It is what lets a host tell whether the agent changed a file without downloading it, and the digest is directly comparable to a content-addressed store's version. Paths the daemon could not read are omitted from the result rather than erroring, so match results by `Path` and read a missing path as *unknown*, not *unchanged*.
+
+`GlobFiles` fills in the cheap half of the same question: `GlobResult.Entries` carries `{Path, Size, ModTime}` per globbed path, stat'd inside the VM in the round trip that already returned the names. `Entries` is additive — a daemon that predates it leaves the field nil and `Files` is untouched — and is **not** index-aligned with `Files`, so match on `Path` there too. Before comparing mtimes, read `sandbox.GlobEntry.ModTime`'s doc comment: the SDK reports nanosecond precision when the guest had it, and a whole-second mtime is ambiguous enough that a caller must treat the file as a hash candidate rather than as unchanged.
 
 The lifecycle side of the contract lives in `sandbox.Manager` — also a plain Go interface:
 
@@ -276,6 +282,8 @@ Athena wraps some operations in a small `withRetry` helper but deliberately skip
 
 The reasoning: read-like and navigate operations are generally safe to retry — if the VM restarted, re-fetching a page or re-reading a file causes no harm. But **browser actions are not idempotent**. Retrying a click, a form fill, or a JavaScript eval could double-submit a form, corrupt state, or produce unpredictable side effects. The same logic applies to writes.
 
+`HashFiles` looks like it belongs in the safe column and does not. It is a question about the guest's *current* state, so a retry that resolves a replacement VM answers about a different filesystem — one rebuilt from the backend, without whatever the agent had just written. The honest failure is to let the error through: oasis's change detector already treats any `HashFiles` error, `ErrHashUnsupported` included, as "fall back to reading the bytes".
+
 This is one reasonable approach, not a requirement imposed by ix. Your own retry policy should be guided by what your app's operations actually do.
 
 ---
@@ -293,12 +301,47 @@ When running as a Docker container (`docker run -p 8080:8080 ghcr.io/nevindra/oa
 | `/health` | GET | Health check; returns 200 when ready |
 | `/v1/shell/exec` | POST | Run a shell command; response is an SSE stream |
 | `/v1/code/execute` | POST | Execute code in a language runtime; SSE stream |
-| `/v1/file/{read,write,edit,glob,grep,tree,stat,upload,download,ls}` | POST / GET | File operations; read/write/search/tree etc. |
+| `/v1/file/{read,write,edit,glob,grep,tree,stat,hash,upload,download,ls}` | POST / GET | File operations; read/write/search/tree/hash etc. |
 | `/v1/browser/{navigate,screenshot,action,snapshot,text,pdf,evaluate,find,wait}` | POST / GET | Full browser automation surface |
 | `/v1/http/fetch` | POST | Fetch a URL, extract readable text |
 | `/v1/web/search` | POST | Web search, returns structured results |
 | `/v1/workspace/info` | GET | OS, arch, working directory, installed tools |
 | `/v1/egress/policy` | GET / PATCH | Read or update the DNS egress policy at runtime |
+
+**Telling what changed without downloading it.** Two file routes exist so a caller can answer "which of these files must I pull back out of the VM?" cheaply:
+
+`POST /v1/file/glob` returns `entries` alongside `files` — one object per path the daemon could stat:
+
+```json
+{
+  "files": ["/workspace/report.md", "/workspace/data.csv"],
+  "entries": [
+    {"path": "/workspace/report.md", "size": 4096,
+     "mod_time": "2026-08-14T09:20:47Z", "mod_time_nanos": 1786699247123456789}
+  ],
+  "truncated": false
+}
+```
+
+`mod_time` is RFC 3339 at second resolution; `mod_time_nanos` is nanoseconds since the Unix epoch and is the field that matters, because an agent rewrites a file twice inside one second routinely and a second-granular mtime cannot separate two versions of the same byte length. `entries` is **not** index-aligned with `files` — in the example above `data.csv` was found but could not be stat'd, so it stays in `files` with no entry, since "here, but undescribed" is a claim a caller can act on and "gone" would not be true. Match on `path`, and read a missing entry as *unknown*, never as *unchanged*.
+
+`POST /v1/file/hash` takes a list of paths:
+
+```json
+{"paths": ["/workspace/report.md", "/workspace/data.csv"]}
+```
+
+and returns a sha256 for each one it could read:
+
+```json
+{"hashes": [
+  {"path": "/workspace/report.md", "hash": "<64 lower-case hex chars>", "size": 4096}
+]}
+```
+
+`size` is the byte length actually digested, counted while hashing rather than stat'd separately, so the two always describe the same read. Each file is streamed through a fixed 64 KB window, so hashing a multi-hundred-megabyte dataset costs the same memory as hashing a README — which matters, because the VM's RAM budget is a few hundred megabytes and the workspace is allowed to be larger than it.
+
+The route is **best-effort and answers 200 either way**: a path that is missing, unreadable, or a directory is simply omitted from `hashes`. The caller enumerated those paths a moment ago while a command was still writing, so one vanished temp file must not cost it the digests of everything else. Results follow request order.
 
 **Streaming:** shell and code-execute endpoints respond with [Server-Sent Events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events) (SSE). Each event has a `type` (`stdout`, `stderr`, `complete`, `error`) and a JSON `data` payload. One-shot endpoints (file operations, browser actions) respond with plain JSON.
 

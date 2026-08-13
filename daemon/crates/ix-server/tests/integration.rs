@@ -390,6 +390,15 @@ async fn glob_returns_matching_files() {
     let file_names: Vec<&str> = files.iter().map(|f| f.as_str().unwrap()).collect();
     assert!(file_names.iter().any(|f| f.ends_with(".txt")));
     assert!(!file_names.iter().any(|f| f.ends_with(".rs")));
+
+    let entries = json["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 2, "each listed file should be described");
+    for entry in entries {
+        assert!(file_names.contains(&entry["path"].as_str().unwrap()));
+        assert_eq!(entry["size"], 1);
+        assert!(entry["mod_time"].is_string());
+        assert!(entry["mod_time_nanos"].as_u64().unwrap() > 0);
+    }
 }
 
 #[tokio::test]
@@ -456,6 +465,45 @@ async fn tree_returns_tree_string() {
     assert!(json["tree"].is_string());
     assert!(json["files"].is_number());
     assert!(json["dirs"].is_number());
+}
+
+#[tokio::test]
+async fn hash_returns_digests_and_skips_bad_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let good = dir.path().join("good.txt");
+    std::fs::write(&good, "hello world").unwrap();
+    let gone = dir.path().join("gone.txt");
+
+    let state = make_state(dir.path().to_str().unwrap());
+    let app = build_router(state);
+
+    let hash_body = serde_json::json!({
+        "paths": [gone.to_str().unwrap(), good.to_str().unwrap()]
+    })
+    .to_string();
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/file/hash")
+                .header("content-type", "application/json")
+                .body(Body::from(hash_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp.into_body()).await;
+    let hashes = json["hashes"].as_array().unwrap();
+    assert_eq!(hashes.len(), 1, "the missing path should be skipped, not 500");
+    assert_eq!(hashes[0]["path"], good.to_str().unwrap());
+    assert_eq!(
+        hashes[0]["hash"],
+        "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+    );
+    assert_eq!(hashes[0]["size"], 11);
 }
 
 #[tokio::test]

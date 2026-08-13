@@ -47,6 +47,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1/file/grep", post(routes::files::grep_files))
         .route("/v1/file/tree", post(routes::files::tree))
         .route("/v1/file/stat", get(routes::files::stat_file))
+        .route("/v1/file/hash", post(routes::files::hash_files))
         .route("/v1/file/upload", post(routes::files::upload_file))
         .route("/v1/file/download", get(routes::files::download_file))
         .route("/v1/file/ls", post(routes::files::list_dir))

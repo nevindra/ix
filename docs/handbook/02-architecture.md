@@ -77,7 +77,7 @@ sequenceDiagram
 | `ix-core` | Shared types, config (`DaemonConfig`), error-to-HTTP mapping, SSE channel primitives. The foundation everything else builds on. |
 | `ix-shell` | Bash execution with streaming output, timeouts, and process-group cleanup so child processes can't outlive their command. |
 | `ix-code` | Polyglot REPL (Python, JavaScript, Bash) via a stdin/stdout sentinel protocol — one persistent kernel process per language, reused across calls. |
-| `ix-files` | Read, write, edit, glob, grep, tree, stat, upload, and download. |
+| `ix-files` | Read, write, edit, glob, grep, tree, stat, hash (streaming sha256), upload, and download. |
 | `ix-fetch` | HTTP fetch (raw or readable-text extraction) and web search via Startpage. |
 | `ix-egress` | DNS-level egress firewall — intercepts DNS queries on `127.0.0.1:53` and blocks non-allowed domains. |
 | `ix-browser` | Headless Chrome via Pinchtab — navigate, screenshot, action, DOM snapshot, PDF, eval, find, wait. |

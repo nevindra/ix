@@ -139,7 +139,30 @@ func ixMux(t *testing.T) *http.ServeMux {
 	mux.HandleFunc("POST /v1/file/glob", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
-			"files": []string{"/app/main.py", "/app/lib/utils.py"},
+			"files":     []string{"/app/main.py", "/app/lib/utils.py"},
+			"truncated": false,
+			"entries": []map[string]any{
+				{"path": "/app/main.py", "size": 128, "mod_time": "2026-08-13T04:11:09Z", "mod_time_nanos": int64(1786623069123456789)},
+				{"path": "/app/lib/utils.py", "size": 256, "mod_time": "2026-08-13T04:12:10Z", "mod_time_nanos": int64(1786623130987654321)},
+			},
+		})
+	})
+
+	// File hash
+	mux.HandleFunc("POST /v1/file/hash", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Paths []string `json:"paths"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("file hash: decode body: %v", err)
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"hashes": []map[string]any{
+				{"path": "/app/main.py", "hash": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08", "size": 128},
+			},
 		})
 	})
 
@@ -507,6 +530,159 @@ func TestIXSandboxGlobFiles(t *testing.T) {
 	}
 	if result.Files[0] != "/app/main.py" {
 		t.Errorf("expected first file '/app/main.py', got %q", result.Files[0])
+	}
+}
+
+func TestIXSandboxGlobFilesEntries(t *testing.T) {
+	s, _ := newTestSandbox(t)
+
+	result, err := s.GlobFiles(context.Background(), sandbox.GlobRequest{
+		Pattern: "**/*.py",
+		Path:    "/app",
+	})
+	if err != nil {
+		t.Fatalf("GlobFiles() returned error: %v", err)
+	}
+	if len(result.Entries) != 2 {
+		t.Fatalf("expected 2 entries, got %d", len(result.Entries))
+	}
+
+	e := result.Entries[0]
+	if e.Path != "/app/main.py" {
+		t.Errorf("expected entry path %q, got %q", "/app/main.py", e.Path)
+	}
+	if e.Size != 128 {
+		t.Errorf("expected size 128, got %d", e.Size)
+	}
+	wantModTime := time.Unix(0, 1786623069123456789).UTC()
+	if !e.ModTime.Equal(wantModTime) {
+		t.Errorf("expected ModTime %v, got %v", wantModTime, e.ModTime)
+	}
+	if e.ModTime.Nanosecond() == 0 {
+		t.Errorf("expected ModTime to carry a sub-second component, got %v", e.ModTime)
+	}
+}
+
+func TestIXSandboxGlobFilesNoEntries(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/file/glob", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"files":     []string{"/app/main.py"},
+			"truncated": false,
+		})
+	})
+
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	s := &IXSandbox{
+		id:      "test-glob-no-entries",
+		baseURL: srv.URL,
+		client:  newClient(srv.URL, srv.Client()),
+	}
+
+	result, err := s.GlobFiles(context.Background(), sandbox.GlobRequest{Pattern: "*.py"})
+	if err != nil {
+		t.Fatalf("GlobFiles() returned error: %v", err)
+	}
+	if result.Entries != nil {
+		t.Errorf("expected Entries to be nil, got %v", result.Entries)
+	}
+	if len(result.Files) != 1 || result.Files[0] != "/app/main.py" {
+		t.Errorf("expected Files unchanged, got %v", result.Files)
+	}
+}
+
+func TestIXSandboxHashFiles(t *testing.T) {
+	s, _ := newTestSandbox(t)
+
+	hashes, err := s.HashFiles(context.Background(), []string{"/app/main.py"})
+	if err != nil {
+		t.Fatalf("HashFiles() returned error: %v", err)
+	}
+	if len(hashes) != 1 {
+		t.Fatalf("expected 1 hash, got %d", len(hashes))
+	}
+	if hashes[0].Path != "/app/main.py" {
+		t.Errorf("expected path %q, got %q", "/app/main.py", hashes[0].Path)
+	}
+	if hashes[0].Digest != "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08" {
+		t.Errorf("unexpected digest %q", hashes[0].Digest)
+	}
+	if hashes[0].Size != 128 {
+		t.Errorf("expected size 128, got %d", hashes[0].Size)
+	}
+}
+
+func TestIXSandboxHashFilesEmpty(t *testing.T) {
+	called := false
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/file/hash", func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"hashes": []map[string]any{}})
+	})
+
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	s := &IXSandbox{
+		id:      "test-hash-empty",
+		baseURL: srv.URL,
+		client:  newClient(srv.URL, srv.Client()),
+	}
+
+	hashes, err := s.HashFiles(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("HashFiles() returned error: %v", err)
+	}
+	if hashes != nil {
+		t.Errorf("expected nil hashes for empty input, got %v", hashes)
+	}
+	if called {
+		t.Error("expected HashFiles with empty paths to make no HTTP call")
+	}
+}
+
+func TestIXSandboxHashFilesMissingPath(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/file/hash", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Paths []string `json:"paths"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("file hash: decode body: %v", err)
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		// Daemon omits /app/missing.py because it could not read it.
+		json.NewEncoder(w).Encode(map[string]any{
+			"hashes": []map[string]any{
+				{"path": "/app/main.py", "hash": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08", "size": 128},
+			},
+		})
+	})
+
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	s := &IXSandbox{
+		id:      "test-hash-missing",
+		baseURL: srv.URL,
+		client:  newClient(srv.URL, srv.Client()),
+	}
+
+	hashes, err := s.HashFiles(context.Background(), []string{"/app/main.py", "/app/missing.py"})
+	if err != nil {
+		t.Fatalf("HashFiles() returned error: %v", err)
+	}
+	if len(hashes) != 1 {
+		t.Fatalf("expected 1 hash (missing path omitted), got %d", len(hashes))
+	}
+	if hashes[0].Path != "/app/main.py" {
+		t.Errorf("expected path %q, got %q", "/app/main.py", hashes[0].Path)
 	}
 }
 

@@ -58,7 +58,7 @@ pub async fn list_dir(path: &str) -> Result<Vec<DirEntry>> {
     Ok(entries)
 }
 
-fn format_system_time(t: std::time::SystemTime) -> String {
+pub(crate) fn format_system_time(t: std::time::SystemTime) -> String {
     use std::time::UNIX_EPOCH;
 
     let secs = t
@@ -73,6 +73,15 @@ fn format_system_time(t: std::time::SystemTime) -> String {
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
         year, month, day, hour, min, sec
     )
+}
+
+/// Nanoseconds since the Unix epoch, the same clock `format_system_time` reads
+/// but without its truncation to whole seconds. Pre-epoch times report 0, as
+/// they do there.
+pub(crate) fn unix_nanos(t: std::time::SystemTime) -> u64 {
+    t.duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
 }
 
 /// Minimal Unix-timestamp → (year, month, day, hour, min, sec) converter (UTC only).

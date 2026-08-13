@@ -12,7 +12,8 @@ use serde_json::{json, Value};
 use tokio_util::io::ReaderStream;
 
 use ix_core::types::{
-    EditFileRequest, GlobRequest, GrepRequest, ReadFileRequest, TreeRequest, WriteFileRequest,
+    EditFileRequest, GlobRequest, GrepRequest, HashRequest, ReadFileRequest, TreeRequest,
+    WriteFileRequest,
 };
 use ix_core::Result;
 
@@ -78,6 +79,14 @@ pub async fn stat_file(
         .ok_or_else(|| ix_core::Error::BadRequest("missing 'path' query parameter".into()))?;
     let stat = ix_files::stat_file(path).await?;
     Ok(Json(stat))
+}
+
+pub async fn hash_files(
+    State(_state): State<Arc<AppState>>,
+    Json(req): Json<HashRequest>,
+) -> Result<Json<ix_core::types::HashResult>> {
+    let result = ix_files::hash_files(req).await?;
+    Ok(Json(result))
 }
 
 pub async fn upload_file(
