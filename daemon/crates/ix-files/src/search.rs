@@ -174,41 +174,71 @@ async fn try_rg_grep(
     // rg exits 1 when no matches — that's fine.
     let stdout = String::from_utf8_lossy(&out.stdout);
 
-    let mut matches = Vec::new();
-    let mut truncated = false;
+    let mut matches: Vec<GrepMatch> = Vec::new();
+
+    // rg's --json stream interleaves "context" events with the "match" event
+    // they surround: before-context lines arrive first, then the match, then
+    // after-context lines. `pending_before` holds context seen ahead of the
+    // next match; once that match is pushed, `open_for_context` routes any
+    // further context lines (up to the next "begin"/"end") onto its
+    // `context_after` instead of starting a new before-buffer.
+    let mut pending_before: Vec<String> = Vec::new();
+    let mut open_for_context = false;
 
     for line in stdout.lines() {
-        if matches.len() >= limit {
-            truncated = true;
-            break;
-        }
         let v: serde_json::Value = serde_json::from_str(line).ok()?;
-        if v["type"] == "match" {
-            let data = &v["data"];
-            let file_path = data["path"]["text"].as_str().unwrap_or("").to_string();
-            let lineno = data["line_number"].as_u64().unwrap_or(0) as usize;
-            let content = data["lines"]["text"]
-                .as_str()
-                .unwrap_or("")
-                .trim_end_matches('\n')
-                .to_string();
+        match v["type"].as_str() {
+            Some("match") => {
+                let data = &v["data"];
+                let file_path = data["path"]["text"].as_str().unwrap_or("").to_string();
+                let lineno = data["line_number"].as_u64().unwrap_or(0) as usize;
+                let content = data["lines"]["text"]
+                    .as_str()
+                    .unwrap_or("")
+                    .trim_end_matches('\n')
+                    .to_string();
 
-            // Context lines.
-            let context_before: Vec<String> = data["submatches"]
-                .as_array()
-                .map(|_| vec![])
-                .unwrap_or_default();
-            let context_after: Vec<String> = vec![];
-
-            matches.push(GrepMatch {
-                path: file_path,
-                line: lineno,
-                content,
-                context_before,
-                context_after,
-            });
+                matches.push(GrepMatch {
+                    path: file_path,
+                    line: lineno,
+                    content,
+                    context_before: std::mem::take(&mut pending_before),
+                    context_after: Vec::new(),
+                });
+                open_for_context = true;
+            }
+            Some("context") => {
+                let text = v["data"]["lines"]["text"]
+                    .as_str()
+                    .unwrap_or("")
+                    .trim_end_matches('\n')
+                    .to_string();
+                if open_for_context {
+                    if let Some(m) = matches.last_mut() {
+                        m.context_after.push(text);
+                    }
+                } else {
+                    pending_before.push(text);
+                }
+            }
+            Some("begin") | Some("end") => {
+                // File boundary: a stray before-context buffer belongs to no
+                // match (rg only emits context around one) and after-context
+                // stops here, since --max-count=1 means each file's match, if
+                // any, has already been claimed.
+                pending_before.clear();
+                open_for_context = false;
+            }
+            _ => {}
         }
     }
+
+    // rg already ran to completion by the time `out` was captured above, so
+    // trimming here (rather than breaking the loop early) costs nothing and
+    // guarantees every match kept has its full context, matching how
+    // `native_grep` computes context at push time.
+    let truncated = matches.len() > limit;
+    matches.truncate(limit);
 
     Some(GrepResult { matches, truncated })
 }
@@ -649,10 +679,11 @@ mod tests {
 
     #[tokio::test]
     async fn grep_returns_context_lines() {
-        // NOTE: context_before/context_after are only populated by the native
-        // fallback. When rg is available it is used instead and the implementation
-        // currently returns empty context vecs from the rg path. This test
-        // verifies that the match itself is correct regardless of backend.
+        // grep_files prefers rg when it's on PATH, falling back to the native
+        // walker otherwise — both backends must honor `context` identically,
+        // since GrepMatch.context_before/context_after is part of the public
+        // contract (ix-core's GrepMatch, mirrored by go-sdk's ContextBefore/
+        // ContextAfter and consumed by oasis's file_search tool).
         let dir = TempDir::new().unwrap();
         create_file(&dir, "ctx.txt", "before\nmatch_me\nafter\n");
 
@@ -670,11 +701,78 @@ mod tests {
         let m = &result.matches[0];
         assert_eq!(m.content, "match_me");
         assert_eq!(m.line, 2);
-        // Native path populates context; rg path leaves them empty. Accept either.
-        if !m.context_before.is_empty() {
-            assert_eq!(m.context_before, vec!["before"]);
+        assert_eq!(m.context_before, vec!["before"]);
+        assert_eq!(m.context_after, vec!["after"]);
+    }
+
+    #[tokio::test]
+    async fn rg_grep_parses_context_from_json_stream() {
+        // Exercises try_rg_grep directly (bypassing the native fallback) so
+        // this pins the rg --json parsing regardless of which backend
+        // grep_files happens to prefer on the machine running the test.
+        if !which("rg") {
+            eprintln!("rg not on PATH — skipping rg-specific context test");
+            return;
         }
-        if !m.context_after.is_empty() {
+
+        let dir = TempDir::new().unwrap();
+        create_file(
+            &dir,
+            "multi.txt",
+            "l1\nl2\nneedle\nl4\nl5\nl6\n", // needle on line 3, context=2
+        );
+        create_file(&dir, "other.txt", "x\nneedle\ny\n"); // needle on line 2, context=2
+
+        let result = try_rg_grep("needle", dir.path().to_str().unwrap(), None, 2, 100)
+            .await
+            .expect("rg should have produced a result");
+
+        assert_eq!(result.matches.len(), 2, "expected one match per file: {:?}", result.matches);
+
+        let multi = result
+            .matches
+            .iter()
+            .find(|m| m.path.ends_with("multi.txt"))
+            .expect("missing match for multi.txt");
+        assert_eq!(multi.line, 3);
+        assert_eq!(multi.content, "needle");
+        assert_eq!(multi.context_before, vec!["l1", "l2"]);
+        assert_eq!(multi.context_after, vec!["l4", "l5"]);
+
+        let other = result
+            .matches
+            .iter()
+            .find(|m| m.path.ends_with("other.txt"))
+            .expect("missing match for other.txt");
+        assert_eq!(other.line, 2);
+        assert_eq!(other.content, "needle");
+        // Only one line available on either side even though context=2 was requested.
+        assert_eq!(other.context_before, vec!["x"]);
+        assert_eq!(other.context_after, vec!["y"]);
+    }
+
+    #[tokio::test]
+    async fn rg_grep_truncates_to_limit_with_full_context() {
+        if !which("rg") {
+            eprintln!("rg not on PATH — skipping rg-specific truncation test");
+            return;
+        }
+
+        let dir = TempDir::new().unwrap();
+        for i in 0..5 {
+            create_file(&dir, &format!("f{i}.txt"), "before\nneedle\nafter\n");
+        }
+
+        let result = try_rg_grep("needle", dir.path().to_str().unwrap(), None, 1, 3)
+            .await
+            .expect("rg should have produced a result");
+
+        assert_eq!(result.matches.len(), 3);
+        assert!(result.truncated);
+        // Every kept match still has complete context — truncation trims the
+        // match list, it does not cut a match's context short.
+        for m in &result.matches {
+            assert_eq!(m.context_before, vec!["before"]);
             assert_eq!(m.context_after, vec!["after"]);
         }
     }
