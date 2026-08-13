@@ -929,3 +929,57 @@ async fn browser_wait_returns_structured_result() {
     assert_eq!(json["kind"], "selector");
     assert_eq!(json["elapsed_ms"], 42);
 }
+
+/// A file larger than axum's 2 MiB default body limit must still upload.
+///
+/// This is the shape of a real failure: a 3.38 MB PDF the user attached in chat
+/// reached `fetch_file`, and the guest answered `HTTP 400`. Nothing about the
+/// message said "too large" — exceeding the limit makes `Multipart::next_field`
+/// fail, `upload_file` maps any multipart failure to `Error::BadRequest`, and
+/// the go-sdk reports the status with the body discarded. So the ceiling has to
+/// be pinned by a test; there is no error text that would ever point at it.
+///
+/// 3 MiB rather than something enormous because the assertion is about which
+/// side of 2 MiB the limit sits on, and a 128 MiB fixture would cost every run.
+#[tokio::test]
+async fn upload_accepts_a_file_larger_than_the_default_body_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("big.bin");
+    let path_str = path.to_str().unwrap();
+    let state = make_state(dir.path().to_str().unwrap());
+    let app = build_router(state);
+
+    let boundary = "----TestBoundaryLarge";
+    let payload = "x".repeat(3 * 1024 * 1024);
+    let multipart_body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"path\"\r\n\r\n{path_str}\r\n\
+         --{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"big.bin\"\r\n\
+         Content-Type: application/octet-stream\r\n\r\n{payload}\r\n\
+         --{boundary}--\r\n"
+    );
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/file/upload")
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(multipart_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a {} byte upload was rejected; the file-transfer routes are back on axum's 2 MiB default",
+        payload.len()
+    );
+    let json = body_json(resp.into_body()).await;
+    assert_eq!(json["bytes_written"].as_u64().unwrap(), payload.len() as u64);
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), payload.len() as u64);
+}

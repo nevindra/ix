@@ -146,10 +146,16 @@ func (c *ixClient) upload(ctx context.Context, path, filePath string, data io.Re
 		return fmt.Errorf("upload %s: %w", path, err)
 	}
 	defer resp.Body.Close()
-	io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
 	if resp.StatusCode >= 400 {
-		return fmt.Errorf("upload %s: HTTP %d", path, resp.StatusCode)
+		// Read the body *before* reporting, as every other method in this file
+		// does. This one discarded it and reported the bare status, which is how
+		// a 3 MB attachment refused by the server's body limit reached the user
+		// as "upload /v1/file/upload: HTTP 400" — while the daemon had in fact
+		// answered `{"error":"bad request: multipart error: …"}`.
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+		return fmt.Errorf("upload %s: HTTP %d: %s", path, resp.StatusCode, respBody)
 	}
+	io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
 	return nil
 }
 

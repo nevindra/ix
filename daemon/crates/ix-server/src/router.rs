@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use axum::extract::DefaultBodyLimit;
 use axum::middleware;
 use axum::routing::{get, post};
 use axum::Router;
@@ -7,6 +8,20 @@ use axum::Router;
 use crate::middleware::request_id::inject_request_id;
 use crate::routes;
 use crate::state::AppState;
+
+/// Body ceiling for the routes that carry file content.
+///
+/// axum defaults every route to 2 MiB. That is a sane default for the JSON
+/// control plane and completely wrong for file transfer: the host uploads
+/// whatever the user attached, and athena accepts files up to 100 MB
+/// (`internal/platform/storage/blob.go:MaxBlobBytes`). A 3 MB PDF therefore
+/// reached this server and was refused — and refused *opaquely*, because
+/// exceeding the limit makes `Multipart::next_field` fail, which maps to
+/// `Error::BadRequest` and reaches the caller as a bare `HTTP 400`.
+///
+/// Set above athena's ceiling on purpose, so the host's limit is the one that
+/// speaks and this one only ever catches something that has already gone wrong.
+const FILE_BODY_LIMIT: usize = 128 * 1024 * 1024;
 
 pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
@@ -23,11 +38,13 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         )
         .route(
             "/sandboxes/{id}/files",
-            get(routes::files::e2b_read_file).post(routes::files::e2b_write_file),
+            get(routes::files::e2b_read_file)
+                .post(routes::files::e2b_write_file)
+                .layer(DefaultBodyLimit::max(FILE_BODY_LIMIT)),
         )
         .route(
             "/sandboxes/{id}/files/upload",
-            post(routes::files::e2b_upload),
+            post(routes::files::e2b_upload).layer(DefaultBodyLimit::max(FILE_BODY_LIMIT)),
         )
         .route(
             "/sandboxes/{id}/files/download",
@@ -41,14 +58,20 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1/shell/exec", post(routes::shell::shell_exec))
         .route("/v1/code/execute", post(routes::code::code_exec))
         .route("/v1/file/read", post(routes::files::read_file))
-        .route("/v1/file/write", post(routes::files::write_file))
+        .route(
+            "/v1/file/write",
+            post(routes::files::write_file).layer(DefaultBodyLimit::max(FILE_BODY_LIMIT)),
+        )
         .route("/v1/file/edit", post(routes::files::edit_file))
         .route("/v1/file/glob", post(routes::files::glob_files))
         .route("/v1/file/grep", post(routes::files::grep_files))
         .route("/v1/file/tree", post(routes::files::tree))
         .route("/v1/file/stat", get(routes::files::stat_file))
         .route("/v1/file/hash", post(routes::files::hash_files))
-        .route("/v1/file/upload", post(routes::files::upload_file))
+        .route(
+            "/v1/file/upload",
+            post(routes::files::upload_file).layer(DefaultBodyLimit::max(FILE_BODY_LIMIT)),
+        )
         .route("/v1/file/download", get(routes::files::download_file))
         .route("/v1/file/ls", post(routes::files::list_dir))
         .route("/v1/browser/navigate", post(routes::browser::navigate))
