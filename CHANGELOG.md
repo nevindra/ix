@@ -21,7 +21,9 @@ Tags follow the Go module convention for the SDK (`go-sdk/vX.Y.Z`).
 
   The lockfile is now copied and the build runs `--locked`, so a lockfile that
   has drifted from `Cargo.toml` is a loud error rather than a silent
-  re-resolve. Tagged `v0.3.3` (daemon); the Go SDK is unaffected.
+  re-resolve. `cmd/Dockerfile.arm64` carried the same gap and got the same fix;
+  no CI job builds it, so it would have failed only in someone's hands. Tagged
+  `v0.3.3` (daemon); the Go SDK is unaffected.
 
 ## [0.3.4] - 2026-08-19
 
