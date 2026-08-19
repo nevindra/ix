@@ -2,3 +2,5 @@ github.com/bmatcuk/doublestar/v4 v4.10.0 h1:zU9WiOla1YA122oLM6i4EXvGW62DvKZVxIe6
 github.com/bmatcuk/doublestar/v4 v4.10.0/go.mod h1:xBQ8jztBU6kakFMg+8WGxn0c6z1fTSPVIjEY1Wr7jzc=
 github.com/google/uuid v1.6.0 h1:NIvaJDMOsjHA8n1jAhLSgzrAzy1Hgr+hNrb57e+94F0=
 github.com/google/uuid v1.6.0/go.mod h1:TIyPZe4MgqvfeYDBFedMoGGpEw/LqOeaOT+nhxU+yHo=
+github.com/nevindra/oasis v0.36.0 h1:raw66UqY6XJ3/A7A1g0kkqu5D6J5CQCqsaHW8XHLKm4=
+github.com/nevindra/oasis v0.36.0/go.mod h1:ixHd7/SaWXNpVvp0KBDeJZmZlwjxLyUEAksBo+a8ZtE=
