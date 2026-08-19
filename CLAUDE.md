@@ -87,4 +87,4 @@ ix-server (binary: ixd)
 
 ## Runtime
 
-Production uses Firecracker MicroVMs (KVM) with per-VM TAP devices + host NAT for outbound networking. The Docker image (`daemon/cmd/Dockerfile`) is used to build rootfs images and for Docker-based dev/CI. Design specs for ongoing work are in `docs/superpowers/specs/`; reader-facing documentation is in `docs/handbook/`.
+Production uses Firecracker MicroVMs (KVM) with per-VM TAP devices + host NAT for outbound networking. The Docker image (`daemon/cmd/Dockerfile`) is used to build rootfs images and for Docker-based dev/CI. Reader-facing documentation is in `docs/handbook/`. The vocabulary ix uses is defined in `CONTEXT.md`, decisions already taken are in `docs/adr/`, and work not yet built is in `docs/prd/`.

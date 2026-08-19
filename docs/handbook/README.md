@@ -21,6 +21,7 @@ readable without deep systems knowledge. Diagrams render directly on GitHub.
 ## Keeping these docs honest
 
 Each document carries a `<!-- source-of-truth: … -->` comment naming the code
-it was written against. If you change that code, re-check the document. Design
-history and work-in-progress plans live separately in
-[`docs/superpowers/`](../superpowers/).
+it was written against. If you change that code, re-check the document. The
+vocabulary these documents use is defined in [`CONTEXT.md`](../../CONTEXT.md);
+decisions already taken live in [`docs/adr/`](../adr/), and work not yet built in
+[`docs/prd/`](../prd/).

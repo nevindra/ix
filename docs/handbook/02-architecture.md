@@ -1,4 +1,4 @@
-<!-- source-of-truth: daemon/crates/*, go-sdk/manager.go, go-sdk/sandbox.go, go-sdk/vmm.go, go-sdk/vmm_vsock.go, go-sdk/network.go, go-sdk/reaper.go, go-sdk/health.go, go-sdk/snapshot.go, docs/superpowers/specs/2026-06-03-vm-networking-tap-nat-design.md -->
+<!-- source-of-truth: daemon/crates/*, go-sdk/manager.go, go-sdk/sandbox.go, go-sdk/vmm.go, go-sdk/vmm_vsock.go, go-sdk/network.go, go-sdk/reaper.go, go-sdk/health.go, go-sdk/snapshot.go -->
 
 # 02 — Architecture
 

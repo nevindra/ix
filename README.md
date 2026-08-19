@@ -163,7 +163,7 @@ sequenceDiagram
     SB-->>App: result
 ```
 
-With `BrowserMode: "remote"`, the SDK boots the browser-tier VM, starts the gateway (default `169.254.0.1:9100`), and injects `IX_BROWSER_MODE=remote=<url>` and `IX_CHAT_ID=<session id>` into each chat's VM automatically. (Alternatively, `BrowserGatewayURL` can point at an externally managed gateway.) The shared tier is **opt-in** and meant for Firecracker-host deployments; the default in-VM mode needs no extra setup. Full deployment guide: [docs/handbook/05-operations.md](docs/handbook/05-operations.md); design history: `docs/superpowers/specs/`.
+With `BrowserMode: "remote"`, the SDK boots the browser-tier VM, starts the gateway (default `169.254.0.1:9100`), and injects `IX_BROWSER_MODE=remote=<url>` and `IX_CHAT_ID=<session id>` into each chat's VM automatically. (Alternatively, `BrowserGatewayURL` can point at an externally managed gateway.) The shared tier is **opt-in** and meant for Firecracker-host deployments; the default in-VM mode needs no extra setup. Full deployment guide: [docs/handbook/05-operations.md](docs/handbook/05-operations.md).
 
 ## Prerequisites
 
