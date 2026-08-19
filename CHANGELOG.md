@@ -6,6 +6,10 @@ Tags follow the Go module convention for the SDK (`go-sdk/vX.Y.Z`).
 
 ## [Unreleased]
 
+## [0.3.4] - 2026-08-19
+
+Tagged `go-sdk/v0.3.4` (SDK) and `v0.3.2` (daemon); this release changes both.
+
 ### Added
 
 - **`POST /v1/file/hash` — sha256 inside the VM, so a host can tell what changed
@@ -66,6 +70,40 @@ Tags follow the Go module convention for the SDK (`go-sdk/vX.Y.Z`).
   `mod_time_nanos` whenever the daemon reported it and falling back to parsing
   `mod_time`. A timestamp it cannot parse is left as the zero time, because an
   unknown mtime is safe — the caller hashes the file — and a wrong one is not.
+
+### Changed
+
+- **Requires oasis v0.36.0.** The `FileHasher` capability and
+  `GlobResult.Entries` that this release implements were unpublished while it
+  was being written, so `go-sdk` carried a `replace` onto a sibling checkout.
+  Both ship in oasis v0.36.0, the `replace` is gone, and the module builds
+  from a clean clone again.
+
+### Fixed
+
+- **`/v1/file/search` discarded every context line it was asked for.** The
+  ripgrep backend passed `--before-context`/`--after-context`, so rg did the
+  extra scan and emitted `context` JSON events — and the parsing loop handled
+  only `match`, hard-coding `context_before`/`context_after` to empty. rg is
+  the preferred backend whenever it is on `PATH`, so in practice the model read
+  search results with no surrounding lines while the native fallback returned
+  them: two backends, two answers to the same question, and the one in daily
+  use was the broken one. Context events now buffer and attach to the match
+  that follows, with begin/end events resetting the buffer so lines cannot leak
+  across a file boundary. Truncation moved to a post-pass, which stops a kept
+  match's `context_after` from being cut short.
+
+- **File-carrying routes answered HTTP 400 on anything over 2 MiB.** axum's
+  default body limit is right for the JSON control plane and wrong for file
+  transfer — athena accepts uploads up to 100 MB, so a 3.4 MB PDF attached in
+  chat reached `fetch_file` and the guest refused it. Nothing in the refusal
+  said "too large": exceeding the limit fails `Multipart::next_field`, which
+  maps to `Error::BadRequest`. `FILE_BODY_LIMIT` is now 128 MiB on both upload
+  and both write routes, deliberately above athena's own ceiling so the host's
+  limit is the one that speaks. `ixClient.upload` also read and discarded the
+  response body before checking status, alone among the four request helpers,
+  which is why the failure arrived as a bare status with the daemon's
+  explanation thrown away.
 
 ## [0.3.3] - 2026-07-24
 
@@ -230,7 +268,8 @@ First tagged release.
 - SDK aligned with the Oasis sandbox contract; Go module renamed to
   `github.com/nevindra/ix/go-sdk`.
 
-[Unreleased]: https://github.com/nevindra/ix/compare/go-sdk/v0.3.3...HEAD
+[Unreleased]: https://github.com/nevindra/ix/compare/go-sdk/v0.3.4...HEAD
+[0.3.4]: https://github.com/nevindra/ix/compare/go-sdk/v0.3.3...go-sdk/v0.3.4
 [0.3.3]: https://github.com/nevindra/ix/compare/go-sdk/v0.3.2...go-sdk/v0.3.3
 [0.3.2]: https://github.com/nevindra/ix/compare/go-sdk/v0.3.0...go-sdk/v0.3.2
 [0.3.1]: https://github.com/nevindra/ix/compare/v0.3.0...v0.3.1
