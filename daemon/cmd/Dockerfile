@@ -2,12 +2,21 @@
 FROM rust:1.87-bookworm AS builder
 RUN apt-get update && apt-get install -y musl-tools && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
-# Copy workspace files
-COPY Cargo.toml ./
+# Copy workspace files.
+#
+# Cargo.lock is NOT optional here. Without it cargo re-resolves the whole graph
+# on every image build, so the image tracks whatever crates.io published most
+# recently rather than what was tested — and a transitive crate raising its MSRV
+# breaks a build whose own source never changed. That is exactly what happened:
+# icu_* 2.3.0 shipped requiring rustc 1.88, and every ix image build started
+# failing at dependency resolution while `cargo build` on a developer machine
+# (which does read the lockfile) kept passing.
+COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
-# Build release binary with musl for static linking
+# Build release binary with musl for static linking.
+# --locked makes a stale lockfile a loud error instead of a silent re-resolve.
 RUN rustup target add x86_64-unknown-linux-musl && \
-    cargo build --release --target x86_64-unknown-linux-musl -p ix-server && \
+    cargo build --locked --release --target x86_64-unknown-linux-musl -p ix-server && \
     cp target/x86_64-unknown-linux-musl/release/ixd /ixd
 
 # Stage 2: Base image

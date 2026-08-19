@@ -6,6 +6,23 @@ Tags follow the Go module convention for the SDK (`go-sdk/vX.Y.Z`).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Image builds ignored `Cargo.lock` and re-resolved the whole dependency
+  graph.** `daemon/cmd/Dockerfile` copied `Cargo.toml` and `crates/` but never
+  the lockfile, so every image was built against whatever crates.io had
+  published most recently rather than against what was tested. It failed the
+  way that class of bug always fails — with nobody having changed anything:
+  `icu_*` 2.3.0 shipped requiring rustc 1.88, the builder is pinned to
+  `rust:1.87-bookworm`, and image builds began erroring at dependency
+  resolution while `cargo build` on a developer machine kept passing because it
+  reads the lockfile. Confirmed by rebuilding commit `311d409`, whose CI passed
+  on 2026-07-24: it fails today with the identical error, source unchanged.
+
+  The lockfile is now copied and the build runs `--locked`, so a lockfile that
+  has drifted from `Cargo.toml` is a loud error rather than a silent
+  re-resolve. Tagged `v0.3.3` (daemon); the Go SDK is unaffected.
+
 ## [0.3.4] - 2026-08-19
 
 Tagged `go-sdk/v0.3.4` (SDK) and `v0.3.2` (daemon); this release changes both.
