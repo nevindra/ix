@@ -37,6 +37,24 @@ mount -t overlay overlay \
 mkdir -p /scratch/newroot/workspace
 mount --bind /scratch/workspace /scratch/newroot/workspace
 
+# Optional Volume (PRD volumes.md): a host-persistent ext4 attached as the
+# third drive, mounted at IX_VOLUME_PATH inside the new root. No arg or no
+# drive = no-op, so an old SDK still boots this stage0. Journal is on, so a
+# power-cut destroy replays here on mount.
+# /proc is not mounted this early; the old-root detach below takes this
+# mount away again, so ix-init's own proc mount is unaffected.
+mount -t proc proc /proc 2>/dev/null || true
+volume_path=""
+for param in $(cat /proc/cmdline); do
+  case "$param" in
+    ix.env.IX_VOLUME_PATH=*) volume_path="${param#ix.env.IX_VOLUME_PATH=}" ;;
+  esac
+done
+if [ -n "$volume_path" ] && [ -b /dev/vdc ]; then
+  mkdir -p "/scratch/newroot$volume_path"
+  mount -o noatime /dev/vdc "/scratch/newroot$volume_path"
+fi
+
 # Pivot into the overlay. put_old must exist inside the new root; mkdir here
 # writes to the upper layer (the overlay root is writable).
 cd /scratch/newroot

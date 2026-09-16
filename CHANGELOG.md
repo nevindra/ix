@@ -6,6 +6,33 @@ Tags follow the Go module convention for the SDK (`go-sdk/vX.Y.Z`).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-16
+
+Tagged `go-sdk/v0.4.0` (SDK); the daemon is unchanged at `v0.3.3`. The SDK minor
+moves because this release changes the rootfs too: `ix-stage0` gained the Volume
+mount, so a bundle built from this tag is `-sdk0.4` and Athena must bump
+`IX_BUNDLE_VERSION` and `ATHENA_ROOTFS_VERSION` together with the `go-sdk` pin.
+
+### Added
+
+- **Volumes: a host-local disk that outlives the sandbox it is attached to.**
+  Repository-shaped work (clone, check out, run a code-review skill) paid for a
+  full clone on every run because a sandbox's disk dies with it, and pushing
+  a `.git` directory through Oasis's per-file commit path is the same class of
+  incident as the `node_modules` tree that once filled a production database.
+  `mgr.CreateWithVolume(ctx, opts, key)` attaches `<RunDir>/volumes/<key>.ext4`
+  (sparse, journalled, created on first use) as `/dev/vdc` and `ix-stage0`
+  mounts it at `ManagerConfig.VolumePath` (default `/data`, refused at or under
+  `/workspace`). One sandbox at a time: a second attach returns `ErrVolumeBusy`.
+  The file survives `Destroy` (after a best-effort `sync`), is reattached on a
+  health-monitor restart, and is evicted oldest-first by the reaper only when
+  disk pressure has nothing else left to evict. `ListVolumes` and `DeleteVolume`
+  round it out. Volume-bearing sandboxes cold-boot, since a snapshot-restored VM
+  cannot take a drive the golden snapshot did not have. A Volume is a cache of
+  the git remote, not durability, and ADR 0002 stands: see ADR 0003 and
+  `docs/prd/volumes.md`. **Rebuild every rootfs tier**: the mount lives in
+  `ix-stage0`, and an old rootfs attaches the drive but leaves `/data` empty.
+
 ### Fixed
 
 - **Image builds ignored `Cargo.lock` and re-resolved the whole dependency
@@ -287,7 +314,8 @@ First tagged release.
 - SDK aligned with the Oasis sandbox contract; Go module renamed to
   `github.com/nevindra/ix/go-sdk`.
 
-[Unreleased]: https://github.com/nevindra/ix/compare/go-sdk/v0.3.4...HEAD
+[Unreleased]: https://github.com/nevindra/ix/compare/go-sdk/v0.4.0...HEAD
+[0.4.0]: https://github.com/nevindra/ix/compare/go-sdk/v0.3.4...go-sdk/v0.4.0
 [0.3.4]: https://github.com/nevindra/ix/compare/go-sdk/v0.3.3...go-sdk/v0.3.4
 [0.3.3]: https://github.com/nevindra/ix/compare/go-sdk/v0.3.2...go-sdk/v0.3.3
 [0.3.2]: https://github.com/nevindra/ix/compare/go-sdk/v0.3.0...go-sdk/v0.3.2

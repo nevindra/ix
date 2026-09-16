@@ -56,6 +56,12 @@ document, running a query, rendering a chart. The rest of a sandbox's life is wa
 The private disk where everything a sandbox writes lands. The root filesystem itself is
 shared and read-only across all sandboxes.
 
+**Volume**:
+A host-local disk that outlives the sandbox it is attached to, holding a checkout that
+would otherwise be cloned on every run. Attached to one sandbox at a time, mounted outside
+`/workspace`, and a cache: the git remote is the durable copy (ADR 0003).
+_Avoid_: workspace, persistent sandbox, volume mount (Docker sense)
+
 **Egress Policy**:
 The rule set naming which destinations a sandbox may reach over the network.
 _Avoid_: firewall, ACL, allowlist (the policy may be either allow- or deny-shaped)

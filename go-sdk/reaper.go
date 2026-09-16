@@ -63,6 +63,8 @@ func (m *IXManager) reapDisk(ctx context.Context) {
 	m.mu.RUnlock()
 
 	if oldestSID == "" {
+		// Nothing running to evict: fall back to unattached Volumes, oldest first.
+		m.evictOldestVolume()
 		return
 	}
 

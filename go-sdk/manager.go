@@ -27,13 +27,13 @@ type ResourceSpec struct {
 
 // ManagerConfig configures an IXManager.
 type ManagerConfig struct {
-	RootfsImage       string        // path to ext4 rootfs image (required)
-	KernelPath        string        // path to vmlinux kernel (required)
-	FCBinary          string        // path to firecracker binary; empty searches PATH
-	MaxConcurrent     int           // 0 = auto-detect from host resources
-	DefaultTTL        time.Duration // idle timeout: VM reaped after this long with no requests; refreshed on every request (default: 1 hour)
-	PerSandbox        ResourceSpec  // per-VM resource limits
-	MaxRestarts       int           // default: 3
+	RootfsImage   string        // path to ext4 rootfs image (required)
+	KernelPath    string        // path to vmlinux kernel (required)
+	FCBinary      string        // path to firecracker binary; empty searches PATH
+	MaxConcurrent int           // 0 = auto-detect from host resources
+	DefaultTTL    time.Duration // idle timeout: VM reaped after this long with no requests; refreshed on every request (default: 1 hour)
+	PerSandbox    ResourceSpec  // per-VM resource limits
+	MaxRestarts   int           // default: 3
 
 	// Health monitor tunables. A busy VM (in-flight request) is skipped
 	// entirely — it is alive by definition even if a CPU-bound task starves
@@ -86,6 +86,10 @@ type ManagerConfig struct {
 	// each VM writes to a private sparse scratch disk (overlay upper layer).
 	RunDir        string // base dir for per-VM runtime dirs (sockets + scratch disks); default: <dir of RootfsImage>/run. Must NOT be on tmpfs.
 	ScratchSizeMB int64  // per-VM scratch disk size in MB (sparse; allocates only what is written); default 10240
+
+	// Volumes: host-persistent disks attached via CreateWithVolume (ADR 0003).
+	VolumeSizeMB int64  // size of a new Volume in MB (sparse; fixed at first create); default 20480
+	VolumePath   string // guest mount point; must not be / or under /workspace; default /data
 }
 
 // ipForwardEnabled reads /proc/sys/net/ipv4/ip_forward (no privilege needed).
@@ -167,6 +171,12 @@ func (c *ManagerConfig) applyDefaults() {
 	if c.ScratchSizeMB == 0 {
 		c.ScratchSizeMB = 10240
 	}
+	if c.VolumeSizeMB == 0 {
+		c.VolumeSizeMB = 20480
+	}
+	if c.VolumePath == "" {
+		c.VolumePath = "/data"
+	}
 	if c.RunDir == "" && c.RootfsImage != "" {
 		// Default next to the rootfs image: that path is operator-managed real
 		// disk. os.TempDir() would risk tmpfs — sparse scratch growth would
@@ -197,6 +207,7 @@ type IXManager struct {
 	cfg       ManagerConfig
 	vmm       *firecrackerBackend
 	sandboxes map[string]*IXSandbox // keyed by sessionID
+	volumes   map[string]string     // attached Volume key → sessionID; guarded by mu
 	mu        sync.RWMutex
 	semaphore chan struct{} // concurrency limiter
 	accepting atomic.Bool
@@ -240,6 +251,9 @@ func NewManager(ctx context.Context, cfg ManagerConfig) (*IXManager, error) {
 	}
 	if cfg.FCBinary == "" {
 		return nil, fmt.Errorf("firecracker not found in PATH (set FCBinary)")
+	}
+	if err := validateVolumePath(cfg.VolumePath); err != nil {
+		return nil, err
 	}
 
 	if err := os.MkdirAll(cfg.RunDir, 0o700); err != nil {
@@ -498,8 +512,12 @@ func (m *IXManager) Create(ctx context.Context, opts sandbox.CreateOpts) (sandbo
 		return sb, nil
 	}
 
-	// Slow path: create on demand.
+	return m.createCold(ctx, resolved, "")
+}
 
+// createCold boots a fresh VM for resolved. volumeKey, when set, attaches
+// that Volume as an extra drive and forces a cold boot (no snapshot restore).
+func (m *IXManager) createCold(ctx context.Context, resolved sandbox.CreateOpts, volumeKey string) (sandbox.Sandbox, error) {
 	// Acquire concurrency slot.
 	if err := acquireSlot(ctx, m.semaphore, func() bool { return m.evictIdle(ctx) }, 30*time.Second); err != nil {
 		return nil, err
@@ -518,22 +536,10 @@ func (m *IXManager) Create(ctx context.Context, opts sandbox.CreateOpts) (sandbo
 		memMB = 128
 	}
 
-	// Build env vars.
-	envSlice := m.buildEnvSlice(resolved.Env, resolved.SessionID, resolved.Browser)
-
-	// Launch Firecracker VM.
-	handle, err := m.vmm.startVM(ctx, sandboxID, vcpus, memMB, resolved.Image, envSlice, nil)
+	handle, err := m.bootVM(ctx, sandboxID, vcpus, memMB, resolved.Image, resolved.Env, resolved.SessionID, resolved.Browser, volumeKey)
 	if err != nil {
 		m.releaseSlot()
-		return nil, fmt.Errorf("start VM: %w", err)
-	}
-
-	if m.vmm.snapshot == nil || !m.vmm.snapshot.Ready() {
-		if err := m.vmm.waitReady(ctx, handle); err != nil {
-			m.vmm.cleanup(handle)
-			m.releaseSlot()
-			return nil, fmt.Errorf("wait ready: %w", err)
-		}
+		return nil, err
 	}
 
 	transport := vsockTransport(handle.VsockPath)
@@ -546,6 +552,7 @@ func (m *IXManager) Create(ctx context.Context, opts sandbox.CreateOpts) (sandbo
 		createdAt:    now,
 		idleTTL:      ttl,
 		shellSession: "default",
+		volume:       volumeKey,
 	}
 	sb.touch()
 
@@ -558,9 +565,47 @@ func (m *IXManager) Create(ctx context.Context, opts sandbox.CreateOpts) (sandbo
 		"pid", handle.Process.Pid,
 		"cid", handle.CID,
 		"ttl", ttl,
+		"volume", volumeKey,
 	)
 
 	return sb, nil
+}
+
+// bootVM starts a VM and waits for the daemon. Shared by createCold and
+// restart so a Volume-bearing sandbox comes back with its Volume after a
+// health restart.
+func (m *IXManager) bootVM(ctx context.Context, sandboxID string, vcpus int, memMB int64, image string, userEnv map[string]string, chatID string, browser *bool, volumeKey string) (*VMMHandle, error) {
+	drives, volEnv := m.volumeDrive(volumeKey)
+	if volEnv != nil {
+		merged := make(map[string]string, len(userEnv)+1)
+		for k, v := range userEnv {
+			merged[k] = v
+		}
+		for k, v := range volEnv {
+			merged[k] = v
+		}
+		userEnv = merged
+	}
+	envSlice := m.buildEnvSlice(userEnv, chatID, browser)
+
+	var handle *VMMHandle
+	var err error
+	if volumeKey != "" {
+		handle, err = m.vmm.startVMCold(ctx, sandboxID, vcpus, memMB, image, envSlice, drives, false)
+	} else {
+		handle, err = m.vmm.startVM(ctx, sandboxID, vcpus, memMB, image, envSlice, nil)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("start VM: %w", err)
+	}
+
+	if volumeKey != "" || m.vmm.snapshot == nil || !m.vmm.snapshot.Ready() {
+		if err := m.vmm.waitReady(ctx, handle); err != nil {
+			m.vmm.cleanup(handle)
+			return nil, fmt.Errorf("wait ready: %w", err)
+		}
+	}
+	return handle, nil
 }
 
 // Get retrieves an existing sandbox by session ID.
@@ -699,8 +744,12 @@ func (m *IXManager) destroy(ctx context.Context, sessionID string) error {
 		return sandbox.ErrNotFound
 	}
 
+	if sb.volume != "" {
+		m.syncVolume(sb)
+	}
 	sb.Close()
 	m.vmm.cleanup(sb.vmm)
+	m.releaseVolume(sb.volume)
 	m.releaseSlot()
 	return nil
 }

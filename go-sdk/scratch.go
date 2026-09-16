@@ -32,34 +32,38 @@ func ensureScratchTemplate(path string, sizeMB int64) error {
 	if _, err := os.Stat(path); err == nil {
 		return nil
 	}
+	// Scratch is ephemeral by design (per-VM, deleted on destroy): no journal.
+	return mkfsSparse(path, sizeMB, false)
+}
 
-	// Per-PID tmp name: two processes racing on the same template each build
-	// their own file and the atomic rename below is last-writer-wins — both
-	// produce an identical empty template, so either winning is fine. A stale
-	// tmp from a crashed process is orphaned but harmless (and tiny: sparse).
+// mkfsSparse creates a sparse ext4 image at path via a temp file + rename, so
+// a crash mid-mkfs never leaves a half-formatted image at the final path.
+func mkfsSparse(path string, sizeMB int64, journal bool) error {
 	tmp := fmt.Sprintf("%s.%d.tmp", path, os.Getpid())
 	f, err := os.Create(tmp)
 	if err != nil {
-		return fmt.Errorf("create scratch template: %w", err)
+		return fmt.Errorf("create image: %w", err)
 	}
 	if err := f.Truncate(sizeMB << 20); err != nil {
 		f.Close()
 		_ = os.Remove(tmp)
-		return fmt.Errorf("truncate scratch template: %w", err)
+		return fmt.Errorf("truncate image: %w", err)
 	}
 	f.Close()
 
-	// ^has_journal: the scratch is ephemeral by design (per-VM, deleted on
-	// destroy) — journaling buys crash-consistency nobody reads, and costs
-	// extra writes on the agent's /workspace hot path.
-	if out, err := exec.Command("mkfs.ext4", "-F", "-q", "-O", "^has_journal", tmp).CombinedOutput(); err != nil {
+	args := []string{"-F", "-q"}
+	if !journal {
+		args = append(args, "-O", "^has_journal")
+	}
+	args = append(args, tmp)
+	if out, err := exec.Command("mkfs.ext4", args...).CombinedOutput(); err != nil {
 		_ = os.Remove(tmp)
-		return fmt.Errorf("mkfs.ext4 scratch template: %w: %s", err, out)
+		return fmt.Errorf("mkfs.ext4: %w: %s", err, out)
 	}
 
 	if err := os.Rename(tmp, path); err != nil {
 		_ = os.Remove(tmp)
-		return fmt.Errorf("finalize scratch template: %w", err)
+		return fmt.Errorf("finalize image: %w", err)
 	}
 	return nil
 }

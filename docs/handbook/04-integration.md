@@ -258,6 +258,33 @@ There are two cleanup mechanisms:
 
 Both are safe to use together.
 
+### Volumes: keeping a checkout across sandboxes
+
+A sandbox is alive or gone (ADR 0002), and everything it wrote dies with it. That is the right default for agent output, which Oasis has already committed elsewhere, and the wrong default for a git repository the agent only *reads*: cloning it again on every run is the run's dominant cost.
+
+A **Volume** is a host-local disk that outlives the sandbox it is attached to (ADR 0003). It is a sparse ext4 file under `<RunDir>/volumes/<key>.ext4`, attached read-write to one sandbox at a time, and mounted in the guest at `ManagerConfig.VolumePath` (default `/data`).
+
+```go
+// Second run with the same key finds the first run's checkout.
+sb, err := mgr.CreateWithVolume(ctx, sandbox.CreateOpts{SessionID: runID}, volumeKey)
+if errors.Is(err, ix.ErrVolumeBusy) {
+    // Another live sandbox holds this Volume. Wait, or run without one.
+}
+```
+
+What to know before using one:
+
+- **It is a cache, not storage.** The durable copy of a checkout is the git remote. ix evicts the least recently used unattached Volume when the host runs low on disk, and never uploads or backs one up. A skill must check for `/data/repo/.git` and clone when it is missing, every time.
+- **Keep it out of `/workspace`.** Oasis's mount layer walks `/workspace` and commits each file to the backing store; a `.git` directory through that path is thousands of rows. `VolumePath` refuses `/workspace` and anything under it.
+- **One sandbox at a time.** A second `CreateWithVolume` on an attached key returns `ErrVolumeBusy` immediately. ix keeps no queue; your app decides whether to wait or fall back.
+- **Cold boot.** A Volume-bearing sandbox never comes from the pool or the golden snapshot, because a restored VM cannot take a drive the snapshot did not have. Expect roughly a second of extra latency, not the tens of seconds a clone costs.
+- **Credentials never go on it.** Write tokens or SSH keys under the home directory with `WriteFile`; the Volume is reattached later to sandboxes with other callers.
+- **Size is fixed at first create** (`ManagerConfig.VolumeSizeMB`, default 20 GB apparent, sparse). Raise it before the first `CreateWithVolume` for a repository with a large dependency tree.
+
+`mgr.ListVolumes()` reports key, apparent and allocated size, last write, and whether it is attached. `mgr.DeleteVolume(key)` removes one that is not attached.
+
+If `/data` is empty on every run, check `mountpoint -q /data` inside the guest: the mount is done by `ix-stage0`, so a rootfs built before Volumes existed attaches the drive but never mounts it.
+
 ---
 
 ## 6. Case study: athena

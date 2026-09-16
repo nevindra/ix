@@ -75,6 +75,7 @@ func (m *IXManager) restart(ctx context.Context, sessionID string) {
 	oldVMM := old.vmm
 	oldRestartCount := old.restartCount
 	idleTTL := old.idleTTL
+	volume := old.volume
 	remainingIdle := time.Until(time.Unix(0, old.idleDeadline.Load()))
 	if remainingIdle < 0 {
 		remainingIdle = 0
@@ -98,20 +99,10 @@ func (m *IXManager) restart(ctx context.Context, sessionID string) {
 		memMB = 128
 	}
 
-	envSlice := m.buildEnvSlice(nil, sessionID, nil)
-
-	handle, err := m.vmm.startVM(ctx, sandboxID, vcpus, memMB, m.cfg.RootfsImage, envSlice, nil)
+	handle, err := m.bootVM(ctx, sandboxID, vcpus, memMB, m.cfg.RootfsImage, nil, sessionID, nil, volume)
 	if err != nil {
-		m.logger.Error("restart: start VM failed", "session", sessionID, "error", err)
+		m.logger.Error("restart: boot failed", "session", sessionID, "error", err)
 		return
-	}
-
-	if m.vmm.snapshot == nil || !m.vmm.snapshot.Ready() {
-		if err := m.vmm.waitReady(ctx, handle); err != nil {
-			m.vmm.cleanup(handle)
-			m.logger.Error("restart: wait ready failed", "session", sessionID, "error", err)
-			return
-		}
 	}
 
 	transport := vsockTransport(handle.VsockPath)
@@ -125,6 +116,7 @@ func (m *IXManager) restart(ctx context.Context, sessionID string) {
 		idleTTL:      idleTTL,
 		restartCount: oldRestartCount + 1,
 		shellSession: "default",
+		volume:       volume,
 	}
 	newSb.idleDeadline.Store(now.Add(remainingIdle).UnixNano())
 
