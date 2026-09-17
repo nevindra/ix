@@ -8,9 +8,10 @@ Tags follow the Go module convention for the SDK (`go-sdk/vX.Y.Z`).
 
 ## [0.4.0] - 2026-09-16
 
-Tagged `go-sdk/v0.4.0` (SDK); the daemon is unchanged at `v0.3.3`. The SDK minor
-moves because this release changes the rootfs too: `ix-stage0` gained the Volume
-mount, so a bundle built from this tag is `-sdk0.4` and Athena must bump
+Tagged `go-sdk/v0.4.0` (SDK) and `v0.4.0` (daemon/bundle). `ixd` itself is
+unchanged; the `v*` tag versions the bundle the CI builds from it, and this release
+changes the rootfs: `ix-stage0` gained the Volume mount. The SDK minor moves for the
+same reason, so the bundle is `ix-bundle-v0.4.0-sdk0.4` and Athena must bump
 `IX_BUNDLE_VERSION` and `ATHENA_ROOTFS_VERSION` together with the `go-sdk` pin.
 
 ### Added
