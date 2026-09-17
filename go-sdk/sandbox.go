@@ -29,6 +29,7 @@ type IXSandbox struct {
 	restartCount int
 	closed       atomic.Int32
 	shellSession string // default persistent shell session ID; set once at creation
+	volume       string // attached Volume key; empty = none
 }
 
 // errClosed is returned when a method is called on a closed sandbox.
